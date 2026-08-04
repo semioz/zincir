@@ -2,13 +2,7 @@
 
 *A durable execution runtime for multi-agent, tool-using AI workflows. Provider-agnostic, tool-agnostic.*
 
-> Working name — rename before you commit to it publicly.
-
-## What this is
-
 zincir is a Rust library + runtime that makes multi-agent, tool-calling workflows survive crashes, retries, and long-running execution without losing state or re-running completed work. It sits below your agent logic, not inside a specific agent framework: any LLM provider, any tool set, any orchestration pattern can run on top of it.
-
-It answers one question: **if an agent (or a swarm of them) is mid-task and the process dies, can it resume exactly where it left off, without repeating side effects?**
 
 ## Status
 
