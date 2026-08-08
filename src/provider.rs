@@ -78,8 +78,9 @@ pub trait LLMProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Stub — returns a canned response, no tool calls. Lets the runtime loop
-// run end-to-end without an API key.
+// Stub — drives the loop with no API key. First turn issues a write_file
+// tool call; once the tool result is back, it stops. Two iterations max,
+// which is exactly what's needed to exercise the crash window.
 // ---------------------------------------------------------------------------
 
 pub struct StubProvider;
@@ -88,13 +89,31 @@ pub struct StubProvider;
 impl LLMProvider for StubProvider {
     async fn complete(
         &self,
-        _messages: Vec<LlmMessage>,
+        messages: Vec<LlmMessage>,
         _tools: Vec<ToolSchema>,
     ) -> Result<Response> {
+        let seen_tool_result = messages
+            .iter()
+            .rev()
+            .take(2)
+            .any(|m| m.role == "tool");
+
+        if seen_tool_result {
+            return Ok(Response {
+                content: json!("Done. Wrote the file."),
+                tool_calls: vec![],
+                stop_reason: "stop".into(),
+            });
+        }
+
         Ok(Response {
-            content: json!("Hello from the stub provider."),
-            tool_calls: vec![],
-            stop_reason: "stop".into(),
+            content: json!("I'll write the file for you."),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "write_file".into(),
+                args: json!({ "path": "output.txt", "content": "hello" }),
+            }],
+            stop_reason: "tool_use".into(),
         })
     }
 }
