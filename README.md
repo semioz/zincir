@@ -11,7 +11,7 @@ v0.1 foundation:
 - The crate compiles and the single-agent stub loop runs against Postgres.
 - LLM responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs can reconstruct their conversation and resume.
-- The crash-resume test harness exists but has not yet been verified at every crash boundary.
+- Deterministic tests verify process-kill recovery both before and after the demo tool's atomic side effect.
 - Multi-agent coordination, real providers, harness integrations, and sandboxing are not implemented.
 
 ## Current capabilities
@@ -57,7 +57,7 @@ pub trait ToolExecutor: Send + Sync {
 }
 ```
 
-The demo binary currently wires `StubProvider` and `FileAppendExecutor` directly. Provider selection from stored configuration and real provider implementations are future work.
+The demo binary currently wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Provider selection from stored configuration and real provider implementations are future work.
 
 ### Multi-agent schema
 
@@ -86,7 +86,7 @@ See `migrations/0001_init.sql` for the complete schema.
 
 ## Run the demo
 
-Requirements: Rust and a running Postgres database.
+Requirements: Linux or macOS, Rust, and a running Postgres database.
 
 ```bash
 createdb zincir
@@ -98,7 +98,7 @@ The demo:
 1. Creates one run with valid durable configuration.
 2. Calls the stub provider, which requests a `write_file` tool.
 3. Records the tool intent.
-4. Appends the tool-call ID to `output.txt`.
+4. Atomically publishes `output/call_1.json`.
 5. Records the tool result.
 6. Calls the stub provider again and completes the run.
 7. Prints that run and its event log.
@@ -109,7 +109,7 @@ To resume existing `pending` or `running` runs instead of creating a new one:
 DATABASE_URL=postgres://localhost/zincir ZINCIR_RESUME=1 RUST_LOG=info cargo run
 ```
 
-`ZINCIR_OUTPUT_FILE` overrides the demo output path. `ZINCIR_PAUSE_TOOL_MS` pauses before the file side effect for crash testing.
+`ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
 
 ## Crash recovery test
 
@@ -121,7 +121,7 @@ ZINCIR_TEST_DATABASE_URL=postgres://localhost/zincir_test \
   ./tests/crash_kill_resume.sh
 ```
 
-The script builds Zincir, runs the binary directly, polls Postgres until tool intent is persisted, kills that exact process, resumes it, and verifies the exact run ID, event order, status, and output. It currently covers the crash-before-side-effect boundary; crash-after-side-effect recovery requires an idempotent executor and is the next milestone.
+The script builds Zincir and runs two scenarios. It kills the exact binary before the side effect, then repeats after the atomic side effect but before `tool_result` persistence. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
 
 ## Durability contract
 
@@ -141,8 +141,8 @@ It does not currently guarantee:
 
 ## Roadmap
 
-1. Harden and run deterministic crash-boundary tests.
-2. Prove recovery with an idempotent tool executor.
+1. Make event appends and status changes transactional.
+2. Add run leases before supporting concurrent workers.
 3. Add real provider implementations.
 4. Add durable harness integrations such as OpenCode and Claude Code.
 5. Add multi-agent supervision and messaging.

@@ -104,7 +104,7 @@ impl LLMProvider for StubProvider {
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "write_file".into(),
-                args: json!({ "path": "output.txt", "content": "hello" }),
+                args: json!({ "content": "hello" }),
             }],
             stop_reason: "tool_use".into(),
         })

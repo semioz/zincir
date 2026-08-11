@@ -26,12 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let out_path =
-        PathBuf::from(std::env::var("ZINCIR_OUTPUT_FILE").unwrap_or_else(|_| "output.txt".into()));
+    let output_directory =
+        PathBuf::from(std::env::var("ZINCIR_OUTPUT_DIR").unwrap_or_else(|_| "output".into()));
     let runtime = runtime::Runtime::new(
         pool.clone(),
         Arc::new(provider::StubProvider),
-        Arc::new(tool::FileAppendExecutor { path: out_path }),
+        Arc::new(tool::IdempotentFileExecutor {
+            directory: output_directory,
+        }),
     );
 
     // Resume mode: pick up any runs left inflight by a crashed process.
