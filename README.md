@@ -111,6 +111,18 @@ DATABASE_URL=postgres://localhost/zincir ZINCIR_RESUME=1 RUST_LOG=info cargo run
 
 `ZINCIR_OUTPUT_FILE` overrides the demo output path. `ZINCIR_PAUSE_TOOL_MS` pauses before the file side effect for crash testing.
 
+## Crash recovery test
+
+The test uses a dedicated database named `zincir_test` and resets its `public` schema. It refuses to run against any other database name.
+
+```bash
+createdb zincir_test
+ZINCIR_TEST_DATABASE_URL=postgres://localhost/zincir_test \
+  ./tests/crash_kill_resume.sh
+```
+
+The script builds Zincir, runs the binary directly, polls Postgres until tool intent is persisted, kills that exact process, resumes it, and verifies the exact run ID, event order, status, and output. It currently covers the crash-before-side-effect boundary; crash-after-side-effect recovery requires an idempotent executor and is the next milestone.
+
 ## Durability contract
 
 Zincir currently guarantees only what it records:
