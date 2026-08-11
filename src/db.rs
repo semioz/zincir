@@ -3,7 +3,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::types::{AgentRun, Event, EventType, Message, RunStatus};
+use crate::types::{AgentRun, Event, EventType, RunStatus};
 
 // ---------------------------------------------------------------------------
 // agent_runs
@@ -40,11 +40,7 @@ pub async fn get_run(pool: &PgPool, id: Uuid) -> Result<AgentRun> {
         .ok_or_else(|| Error::NotFound(format!("agent_run {id}")))
 }
 
-pub async fn update_run_status(
-    pool: &PgPool,
-    id: Uuid,
-    status: RunStatus,
-) -> Result<()> {
+pub async fn update_run_status(pool: &PgPool, id: Uuid, status: RunStatus) -> Result<()> {
     sqlx::query("UPDATE agent_runs SET status = $1, updated_at = now() WHERE id = $2")
         .bind(status)
         .bind(id)
@@ -131,26 +127,4 @@ pub async fn find_pending_tool_calls(pool: &PgPool, run_id: Uuid) -> Result<Vec<
     .fetch_all(pool)
     .await
     .map_err(Into::into)
-}
-
-// ---------------------------------------------------------------------------
-// messages — v0.2 multi-agent. Queries exist so the schema is exercised.
-// ---------------------------------------------------------------------------
-
-pub async fn list_pending_messages(pool: &PgPool, to_run_id: Uuid) -> Result<Vec<Message>> {
-    sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE to_run_id = $1 AND delivered = false ORDER BY id",
-    )
-    .bind(to_run_id)
-    .fetch_all(pool)
-    .await
-    .map_err(Into::into)
-}
-
-pub async fn mark_message_delivered(pool: &PgPool, id: i64) -> Result<()> {
-    sqlx::query("UPDATE messages SET delivered = true WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }

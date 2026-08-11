@@ -13,9 +13,6 @@ pub enum Error {
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
-    #[error("provider error: {0}")]
-    Provider(String),
-
     #[error("tool error: {0}")]
     Tool(String),
 

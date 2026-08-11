@@ -70,11 +70,8 @@ pub struct Response {
 
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
-    async fn complete(
-        &self,
-        messages: Vec<LlmMessage>,
-        tools: Vec<ToolSchema>,
-    ) -> Result<Response>;
+    async fn complete(&self, messages: Vec<LlmMessage>, tools: Vec<ToolSchema>)
+        -> Result<Response>;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +89,7 @@ impl LLMProvider for StubProvider {
         messages: Vec<LlmMessage>,
         _tools: Vec<ToolSchema>,
     ) -> Result<Response> {
-        let seen_tool_result = messages
-            .iter()
-            .rev()
-            .take(2)
-            .any(|m| m.role == "tool");
+        let seen_tool_result = messages.iter().rev().take(2).any(|m| m.role == "tool");
 
         if seen_tool_result {
             return Ok(Response {

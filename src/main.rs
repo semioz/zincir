@@ -26,19 +26,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let out_path = PathBuf::from(
-        std::env::var("ZINCIR_OUTPUT_FILE").unwrap_or_else(|_| "output.txt".into()),
-    );
+    let out_path =
+        PathBuf::from(std::env::var("ZINCIR_OUTPUT_FILE").unwrap_or_else(|_| "output.txt".into()));
     let runtime = runtime::Runtime::new(
         pool.clone(),
         Arc::new(provider::StubProvider),
-        Arc::new(tool::FileAppendExecutor { path: out_path.clone() }),
+        Arc::new(tool::FileAppendExecutor { path: out_path }),
     );
 
     // Resume mode: pick up any runs left inflight by a crashed process.
-    if std::env::var("ZINCIR_RESUME").is_ok() {
+    let run_ids = if std::env::var("ZINCIR_RESUME").is_ok() {
         tracing::info!("resume mode");
-        runtime.resume().await?;
+        runtime.resume().await?
     } else {
         let config = types::RunConfig {
             model: "stub".into(),
@@ -60,12 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
         tracing::info!(run_id = %run.id, "created run");
         runtime.run(run.id).await?;
-    }
+        vec![run.id]
+    };
 
-    // Print every inflight or terminal run's event log.
-    let inflight = db::list_inflight_runs(&pool).await?;
-    for run in &inflight {
-        print_run(&pool, run.id).await?;
+    for run_id in run_ids {
+        print_run(&pool, run_id).await?;
     }
 
     Ok(())

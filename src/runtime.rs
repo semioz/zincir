@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::error::Result;
-use crate::provider::{LlmMessage, LLMProvider};
+use crate::provider::{LLMProvider, LlmMessage};
 use crate::tool::ToolExecutor;
 use crate::types::{EventType, RunConfig, RunStatus, ToolCall};
 
@@ -48,11 +48,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(
-        pool: PgPool,
-        provider: Arc<dyn LLMProvider>,
-        tools: Arc<dyn ToolExecutor>,
-    ) -> Self {
+    pub fn new(pool: PgPool, provider: Arc<dyn LLMProvider>, tools: Arc<dyn ToolExecutor>) -> Self {
         Self {
             pool,
             provider,
@@ -60,14 +56,15 @@ impl Runtime {
         }
     }
 
-    /// Resume all inflight runs — the crash-recovery entrypoint.
-    pub async fn resume(&self) -> Result<()> {
+    /// Resume all inflight runs and return their IDs.
+    pub async fn resume(&self) -> Result<Vec<Uuid>> {
         let inflight = db::list_inflight_runs(&self.pool).await?;
+        let run_ids = inflight.iter().map(|run| run.id).collect();
         for run in &inflight {
             info!(run_id = %run.id, "resuming run");
             self.run(run.id).await?;
         }
-        Ok(())
+        Ok(run_ids)
     }
 
     /// Run (or resume) a single agent loop to completion.
@@ -121,8 +118,15 @@ impl Runtime {
                 content: result.content.clone(),
             })?;
             let seq = db::next_event_seq(&self.pool, run_id).await?;
-            db::append_event(&self.pool, run_id, seq, EventType::ToolResult, &payload, None)
-                .await?;
+            db::append_event(
+                &self.pool,
+                run_id,
+                seq,
+                EventType::ToolResult,
+                &payload,
+                None,
+            )
+            .await?;
             messages.push(LlmMessage::tool(&call.id, &result.content));
         }
 
@@ -135,10 +139,12 @@ impl Runtime {
                 stop_reason: response.stop_reason.clone(),
             })?;
             let seq = db::next_event_seq(&self.pool, run_id).await?;
-            db::append_event(&self.pool, run_id, seq, EventType::LlmCall, &payload, None)
-                .await?;
+            db::append_event(&self.pool, run_id, seq, EventType::LlmCall, &payload, None).await?;
 
-            messages.push(LlmMessage::assistant(&response.content, &response.tool_calls));
+            messages.push(LlmMessage::assistant(
+                &response.content,
+                &response.tool_calls,
+            ));
 
             if response.tool_calls.is_empty() {
                 db::update_run_status(&self.pool, run_id, RunStatus::Completed).await?;

@@ -96,7 +96,8 @@ macro_rules! impl_sqlx_text_enum {
             fn encode_by_ref(
                 &self,
                 buf: &mut sqlx::postgres::PgArgumentBuffer,
-            ) -> std::result::Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            ) -> std::result::Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Sync + Send>>
+            {
                 self.as_str().encode_by_ref(buf)
             }
         }
@@ -105,9 +106,8 @@ macro_rules! impl_sqlx_text_enum {
                 value: sqlx::postgres::PgValueRef<'r>,
             ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
                 let s = <&str as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
-                s.parse().map_err(|e: Error| -> Box<dyn std::error::Error + Sync + Send> {
-                    Box::new(e)
-                })
+                s.parse()
+                    .map_err(|e: Error| -> Box<dyn std::error::Error + Sync + Send> { Box::new(e) })
             }
         }
     };
@@ -140,16 +140,6 @@ pub struct Event {
     pub event_type: EventType,
     pub payload: Value,
     pub idempotency_key: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct Message {
-    pub id: i64,
-    pub from_run_id: Uuid,
-    pub to_run_id: Uuid,
-    pub payload: Value,
-    pub delivered: bool,
     pub created_at: DateTime<Utc>,
 }
 
