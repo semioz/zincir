@@ -117,16 +117,7 @@ impl Runtime {
                 call_id: call.id.clone(),
                 content: result.content.clone(),
             })?;
-            let seq = db::next_event_seq(&self.pool, run_id).await?;
-            db::append_event(
-                &self.pool,
-                run_id,
-                seq,
-                EventType::ToolResult,
-                &payload,
-                None,
-            )
-            .await?;
+            db::append_event(&self.pool, run_id, EventType::ToolResult, &payload, None).await?;
             messages.push(LlmMessage::tool(&call.id, &result.content));
         }
 
@@ -138,8 +129,7 @@ impl Runtime {
                 tool_calls: response.tool_calls.clone(),
                 stop_reason: response.stop_reason.clone(),
             })?;
-            let seq = db::next_event_seq(&self.pool, run_id).await?;
-            db::append_event(&self.pool, run_id, seq, EventType::LlmCall, &payload, None).await?;
+            db::append_event(&self.pool, run_id, EventType::LlmCall, &payload, None).await?;
 
             messages.push(LlmMessage::assistant(
                 &response.content,
@@ -158,11 +148,9 @@ impl Runtime {
                     name: call.name.clone(),
                     args: call.args.clone(),
                 })?;
-                let seq = db::next_event_seq(&self.pool, run_id).await?;
                 db::append_event(
                     &self.pool,
                     run_id,
-                    seq,
                     EventType::ToolCall,
                     &intent,
                     Some(&call.id),
@@ -174,11 +162,9 @@ impl Runtime {
                     call_id: call.id.clone(),
                     content: result.content.clone(),
                 })?;
-                let seq = db::next_event_seq(&self.pool, run_id).await?;
                 db::append_event(
                     &self.pool,
                     run_id,
-                    seq,
                     EventType::ToolResult,
                     &result_payload,
                     None,

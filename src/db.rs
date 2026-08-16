@@ -1,5 +1,5 @@
-use serde_json::Value;
-use sqlx::PgPool;
+use serde_json::{json, Value};
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -41,11 +41,30 @@ pub async fn get_run(pool: &PgPool, id: Uuid) -> Result<AgentRun> {
 }
 
 pub async fn update_run_status(pool: &PgPool, id: Uuid, status: RunStatus) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    let current = lock_run(&mut transaction, id).await?;
+    if current == status {
+        transaction.commit().await?;
+        return Ok(());
+    }
+
+    let seq = next_event_seq(&mut transaction, id).await?;
+    let payload = json!({ "from": current, "to": status });
+    insert_event(
+        &mut transaction,
+        id,
+        seq,
+        EventType::StateTransition,
+        &payload,
+        None,
+    )
+    .await?;
     sqlx::query("UPDATE agent_runs SET status = $1, updated_at = now() WHERE id = $2")
         .bind(status)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -67,12 +86,51 @@ pub async fn list_inflight_runs(pool: &PgPool) -> Result<Vec<AgentRun>> {
 pub async fn append_event(
     pool: &PgPool,
     run_id: Uuid,
+    event_type: EventType,
+    payload: &Value,
+    idempotency_key: Option<&str>,
+) -> Result<Event> {
+    let mut transaction = pool.begin().await?;
+    lock_run(&mut transaction, run_id).await?;
+    let seq = next_event_seq(&mut transaction, run_id).await?;
+    let event = insert_event(
+        &mut transaction,
+        run_id,
+        seq,
+        event_type,
+        payload,
+        idempotency_key,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(event)
+}
+
+async fn lock_run(connection: &mut PgConnection, run_id: Uuid) -> Result<RunStatus> {
+    sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1 FOR UPDATE")
+        .bind(run_id)
+        .fetch_optional(connection)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("agent_run {run_id}")))
+}
+
+async fn next_event_seq(connection: &mut PgConnection, run_id: Uuid) -> Result<i32> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE run_id = $1")
+        .bind(run_id)
+        .fetch_one(connection)
+        .await
+        .map_err(Into::into)
+}
+
+async fn insert_event(
+    connection: &mut PgConnection,
+    run_id: Uuid,
     seq: i32,
     event_type: EventType,
     payload: &Value,
     idempotency_key: Option<&str>,
 ) -> Result<Event> {
-    let event = sqlx::query_as::<_, Event>(
+    sqlx::query_as::<_, Event>(
         "INSERT INTO events (run_id, seq, event_type, payload, idempotency_key)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING *",
@@ -82,21 +140,9 @@ pub async fn append_event(
     .bind(event_type)
     .bind(payload)
     .bind(idempotency_key)
-    .fetch_one(pool)
-    .await?;
-    Ok(event)
-}
-
-/// Next per-run sequence number.
-/// ponytail: read-modify-write is safe single-writer (v0.1 single-node).
-/// Multi-writer would need SELECT ... FOR UPDATE or an advisory lock.
-pub async fn next_event_seq(pool: &PgPool, run_id: Uuid) -> Result<i32> {
-    let next: i32 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_one(pool)
-            .await?;
-    Ok(next)
+    .fetch_one(connection)
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn get_events(pool: &PgPool, run_id: Uuid) -> Result<Vec<Event>> {
@@ -127,4 +173,69 @@ pub async fn find_pending_tool_calls(pool: &PgPool, run_id: Uuid) -> Result<Vec<
     .fetch_all(pool)
     .await
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn test_run(pool: &PgPool) -> AgentRun {
+        create_run(
+            pool,
+            Uuid::new_v4(),
+            None,
+            "test",
+            "stub",
+            &json!({
+                "model": "stub",
+                "system": "test",
+                "input": "test",
+                "tools": []
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL"]
+    async fn concurrent_appends_get_unique_sequences(pool: PgPool) {
+        let run = test_run(&pool).await;
+        let first_payload = json!({ "writer": 1 });
+        let second_payload = json!({ "writer": 2 });
+
+        let (first, second) = tokio::join!(
+            append_event(&pool, run.id, EventType::LlmCall, &first_payload, None,),
+            append_event(&pool, run.id, EventType::LlmCall, &second_payload, None,),
+        );
+        let mut sequences = vec![first.unwrap().seq, second.unwrap().seq];
+        sequences.sort_unstable();
+
+        assert_eq!(sequences, vec![0, 1]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires PostgreSQL"]
+    async fn status_change_records_one_transition_atomically(pool: PgPool) {
+        let run = test_run(&pool).await;
+
+        update_run_status(&pool, run.id, RunStatus::Running)
+            .await
+            .unwrap();
+        update_run_status(&pool, run.id, RunStatus::Running)
+            .await
+            .unwrap();
+
+        let updated = get_run(&pool, run.id).await.unwrap();
+        let events = get_events(&pool, run.id).await.unwrap();
+
+        assert_eq!(updated.status, RunStatus::Running);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::StateTransition);
+        assert_eq!(
+            events[0].payload,
+            json!({ "from": "pending", "to": "running" })
+        );
+    }
 }

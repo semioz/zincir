@@ -27,9 +27,13 @@ The runtime treats `events` as an append-only, sequence-ordered log:
 - `llm_call` records a completed provider response.
 - `tool_call` records tool intent before execution.
 - `tool_result` records the returned result after execution.
-- `state_transition` is reserved but not emitted yet.
+- `state_transition` records status changes such as `pending → running` and `running → completed`.
 
 On resume, Zincir rebuilds messages from the run configuration and recorded events.
+
+### Transactional event ordering
+
+Before assigning an event sequence, Zincir starts a Postgres transaction and locks the run row with `SELECT ... FOR UPDATE`. Writers for the same run wait their turn, so concurrent appends cannot choose the same sequence. Status changes update `agent_runs` and append their `state_transition` event in the same transaction.
 
 ### Pending tool recovery
 
@@ -123,11 +127,18 @@ ZINCIR_TEST_DATABASE_URL=postgres://localhost/zincir_test \
 
 The script builds Zincir and runs two scenarios. It kills the exact binary before the side effect, then repeats after the atomic side effect but before `tool_result` persistence. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
 
+Postgres concurrency tests are ignored by the default test run because they create temporary databases. Run them explicitly with a database user that can create databases:
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@localhost/zincir_test \
+  cargo test -- --ignored
+```
+
 ## Durability contract
 
 Zincir currently guarantees only what it records:
 
-- A unique event sequence within each run.
+- A unique, transactionally allocated event sequence within each run.
 - One durable tool intent per `(run_id, idempotency_key)`.
 - Replay of persisted LLM responses and tool results.
 - At-least-once recovery of tool intents without results.
@@ -141,12 +152,11 @@ It does not currently guarantee:
 
 ## Roadmap
 
-1. Make event appends and status changes transactional.
-2. Add run leases before supporting concurrent workers.
-3. Add real provider implementations.
-4. Add durable harness integrations such as OpenCode and Claude Code.
-5. Add multi-agent supervision and messaging.
-6. Add tracing, snapshots, and concurrency controls when measurements require them.
+1. Add run leases before supporting concurrent workers.
+2. Add real provider implementations.
+3. Add durable harness integrations such as OpenCode and Claude Code.
+4. Add multi-agent supervision and messaging.
+5. Add tracing, snapshots, and concurrency controls when measurements require them.
 
 ## Non-goals for v1
 
