@@ -1,25 +1,21 @@
 use serde_json::{json, Value};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::types::{AgentRun, Event, EventType, RunStatus};
 
-// ---------------------------------------------------------------------------
-// agent_runs
-// ---------------------------------------------------------------------------
-
 pub async fn create_run(
-    pool: &PgPool,
+    pool: &SqlitePool,
     id: Uuid,
     parent_run_id: Option<Uuid>,
     role: &str,
     provider: &str,
     config: &Value,
 ) -> Result<AgentRun> {
-    let run = sqlx::query_as::<_, AgentRun>(
+    sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs (id, parent_run_id, role, provider, config)
-         VALUES ($1, $2, $3, $4, $5)
+         VALUES (?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(id)
@@ -28,47 +24,57 @@ pub async fn create_run(
     .bind(provider)
     .bind(config)
     .fetch_one(pool)
-    .await?;
-    Ok(run)
+    .await
+    .map_err(Into::into)
 }
 
-pub async fn get_run(pool: &PgPool, id: Uuid) -> Result<AgentRun> {
-    sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs WHERE id = $1")
+pub async fn get_run(pool: &SqlitePool, id: Uuid) -> Result<AgentRun> {
+    sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await?
         .ok_or_else(|| Error::NotFound(format!("agent_run {id}")))
 }
 
-pub async fn update_run_status(pool: &PgPool, id: Uuid, status: RunStatus) -> Result<()> {
-    let mut transaction = pool.begin().await?;
-    let current = lock_run(&mut transaction, id).await?;
-    if current == status {
-        transaction.commit().await?;
-        return Ok(());
-    }
+/// SQLite permits one writer at a time. BEGIN IMMEDIATE reserves that writer
+/// slot before reading the next event sequence, so sequence allocation and
+/// insertion are one atomic operation.
+pub async fn update_run_status(pool: &SqlitePool, id: Uuid, status: RunStatus) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
 
-    let seq = next_event_seq(&mut transaction, id).await?;
-    let payload = json!({ "from": current, "to": status });
-    insert_event(
-        &mut transaction,
-        id,
-        seq,
-        EventType::StateTransition,
-        &payload,
-        None,
-    )
-    .await?;
-    sqlx::query("UPDATE agent_runs SET status = $1, updated_at = now() WHERE id = $2")
+    let result = async {
+        let current = current_status(&mut connection, id).await?;
+        if current == status {
+            return Ok(());
+        }
+
+        let seq = next_event_seq(&mut connection, id).await?;
+        let payload = json!({ "from": current, "to": status });
+        insert_event(
+            &mut connection,
+            id,
+            seq,
+            EventType::StateTransition,
+            &payload,
+            None,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
         .bind(status)
         .bind(id)
-        .execute(&mut *transaction)
+        .execute(&mut *connection)
         .await?;
-    transaction.commit().await?;
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
 }
 
-pub async fn list_inflight_runs(pool: &PgPool) -> Result<Vec<AgentRun>> {
+pub async fn list_inflight_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
     sqlx::query_as::<_, AgentRun>(
         "SELECT * FROM agent_runs
          WHERE status IN ('pending', 'running')
@@ -79,43 +85,65 @@ pub async fn list_inflight_runs(pool: &PgPool) -> Result<Vec<AgentRun>> {
     .map_err(Into::into)
 }
 
-// ---------------------------------------------------------------------------
-// events
-// ---------------------------------------------------------------------------
-
 pub async fn append_event(
-    pool: &PgPool,
+    pool: &SqlitePool,
     run_id: Uuid,
     event_type: EventType,
     payload: &Value,
     idempotency_key: Option<&str>,
 ) -> Result<Event> {
-    let mut transaction = pool.begin().await?;
-    lock_run(&mut transaction, run_id).await?;
-    let seq = next_event_seq(&mut transaction, run_id).await?;
-    let event = insert_event(
-        &mut transaction,
-        run_id,
-        seq,
-        event_type,
-        payload,
-        idempotency_key,
-    )
-    .await?;
-    transaction.commit().await?;
-    Ok(event)
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        current_status(&mut connection, run_id).await?;
+        let seq = next_event_seq(&mut connection, run_id).await?;
+        insert_event(
+            &mut connection,
+            run_id,
+            seq,
+            event_type,
+            payload,
+            idempotency_key,
+        )
+        .await
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
 }
 
-async fn lock_run(connection: &mut PgConnection, run_id: Uuid) -> Result<RunStatus> {
-    sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1 FOR UPDATE")
+async fn begin_immediate(connection: &mut SqliteConnection) -> Result<()> {
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(connection)
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+async fn finish_transaction<T>(connection: &mut SqliteConnection, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            sqlx::query("COMMIT").execute(connection).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(connection).await;
+            Err(error)
+        }
+    }
+}
+
+async fn current_status(connection: &mut SqliteConnection, run_id: Uuid) -> Result<RunStatus> {
+    sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = ?")
         .bind(run_id)
         .fetch_optional(connection)
         .await?
         .ok_or_else(|| Error::NotFound(format!("agent_run {run_id}")))
 }
 
-async fn next_event_seq(connection: &mut PgConnection, run_id: Uuid) -> Result<i32> {
-    sqlx::query_scalar("SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE run_id = $1")
+async fn next_event_seq(connection: &mut SqliteConnection, run_id: Uuid) -> Result<i32> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(seq), -1) + 1 FROM events WHERE run_id = ?")
         .bind(run_id)
         .fetch_one(connection)
         .await
@@ -123,7 +151,7 @@ async fn next_event_seq(connection: &mut PgConnection, run_id: Uuid) -> Result<i
 }
 
 async fn insert_event(
-    connection: &mut PgConnection,
+    connection: &mut SqliteConnection,
     run_id: Uuid,
     seq: i32,
     event_type: EventType,
@@ -132,7 +160,7 @@ async fn insert_event(
 ) -> Result<Event> {
     sqlx::query_as::<_, Event>(
         "INSERT INTO events (run_id, seq, event_type, payload, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5)
+         VALUES (?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(run_id)
@@ -145,8 +173,8 @@ async fn insert_event(
     .map_err(Into::into)
 }
 
-pub async fn get_events(pool: &PgPool, run_id: Uuid) -> Result<Vec<Event>> {
-    sqlx::query_as::<_, Event>("SELECT * FROM events WHERE run_id = $1 ORDER BY seq")
+pub async fn get_events(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<Event>> {
+    sqlx::query_as::<_, Event>("SELECT * FROM events WHERE run_id = ? ORDER BY seq")
         .bind(run_id)
         .fetch_all(pool)
         .await
@@ -154,18 +182,16 @@ pub async fn get_events(pool: &PgPool, run_id: Uuid) -> Result<Vec<Event>> {
 }
 
 /// tool_call events with no matching tool_result — the crash window.
-/// On resume these are re-executed (safe only if the tool is idempotent
-/// or the idempotency_key is respected by the tool).
-pub async fn find_pending_tool_calls(pool: &PgPool, run_id: Uuid) -> Result<Vec<Event>> {
+pub async fn find_pending_tool_calls(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<Event>> {
     sqlx::query_as::<_, Event>(
         "SELECT e.* FROM events e
-         WHERE e.run_id = $1
+         WHERE e.run_id = ?
            AND e.event_type = 'tool_call'
            AND NOT EXISTS (
              SELECT 1 FROM events e2
              WHERE e2.run_id = e.run_id
                AND e2.event_type = 'tool_result'
-               AND e2.payload->>'call_id' = e.idempotency_key
+               AND json_extract(e2.payload, '$.call_id') = e.idempotency_key
            )
          ORDER BY e.seq",
     )
@@ -178,9 +204,29 @@ pub async fn find_pending_tool_calls(pool: &PgPool, run_id: Uuid) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::time::Duration;
 
-    async fn test_run(pool: &PgPool) -> AgentRun {
+    async fn test_pool() -> (SqlitePool, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("zincir-db-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("zincir.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        (pool, directory)
+    }
+
+    async fn test_run(pool: &SqlitePool) -> AgentRun {
         create_run(
             pool,
             Uuid::new_v4(),
@@ -198,26 +244,28 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires PostgreSQL"]
-    async fn concurrent_appends_get_unique_sequences(pool: PgPool) {
+    #[tokio::test]
+    async fn concurrent_appends_get_unique_sequences() {
+        let (pool, directory) = test_pool().await;
         let run = test_run(&pool).await;
         let first_payload = json!({ "writer": 1 });
         let second_payload = json!({ "writer": 2 });
 
         let (first, second) = tokio::join!(
-            append_event(&pool, run.id, EventType::LlmCall, &first_payload, None,),
-            append_event(&pool, run.id, EventType::LlmCall, &second_payload, None,),
+            append_event(&pool, run.id, EventType::LlmCall, &first_payload, None),
+            append_event(&pool, run.id, EventType::LlmCall, &second_payload, None),
         );
         let mut sequences = vec![first.unwrap().seq, second.unwrap().seq];
         sequences.sort_unstable();
 
         assert_eq!(sequences, vec![0, 1]);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires PostgreSQL"]
-    async fn status_change_records_one_transition_atomically(pool: PgPool) {
+    #[tokio::test]
+    async fn status_change_records_one_transition_atomically() {
+        let (pool, directory) = test_pool().await;
         let run = test_run(&pool).await;
 
         update_run_status(&pool, run.id, RunStatus::Running)
@@ -237,5 +285,7 @@ mod tests {
             events[0].payload,
             json!({ "from": "pending", "to": "running" })
         );
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

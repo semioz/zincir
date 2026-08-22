@@ -1,3 +1,6 @@
 /target
 /output
+/zincir.db
+/zincir.db-shm
+/zincir.db-wal
 .env

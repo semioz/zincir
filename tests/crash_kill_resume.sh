@@ -1,26 +1,17 @@
 #!/usr/bin/env bash
-# Verifies crash recovery before and after an idempotent tool side effect.
-# Destructive: only runs against a database named zincir_test.
+# Verifies SQLite-backed crash recovery before and after an idempotent effect.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-DB_URL="${ZINCIR_TEST_DATABASE_URL:-postgres://localhost:5432/zincir_test}"
-DB_NAME="${DB_URL%%\?*}"
-DB_NAME="${DB_NAME##*/}"
-if [[ "$DB_NAME" != "zincir_test" ]]; then
-    echo "Refusing to reset database '$DB_NAME'; expected zincir_test" >&2
-    exit 2
-fi
-
-export DATABASE_URL="$DB_URL"
 export RUST_LOG="info"
 BIN="$ROOT_DIR/target/debug/zincir"
 TMP_ROOT="$(mktemp -d -t zincir-crash.XXXXXX)"
 CHILD_PID=""
 START_LOG=""
 RESUME_LOG=""
+DATABASE_PATH=""
 
 cleanup() {
     if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
@@ -45,11 +36,7 @@ fail() {
 }
 
 sql() {
-    psql "$DB_URL" -XAtq -v ON_ERROR_STOP=1 -c "$1"
-}
-
-reset_database() {
-    sql "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
+    sqlite3 -batch -noheader "$DATABASE_PATH" "$1"
 }
 
 file_inode() {
@@ -62,7 +49,7 @@ file_inode() {
 
 find_running_tool_call() {
     sql "
-        SELECT e.run_id
+        SELECT lower(hex(e.run_id))
         FROM events e
         JOIN agent_runs r ON r.id = e.run_id
         WHERE e.event_type = 'tool_call' AND r.status = 'running'
@@ -106,16 +93,23 @@ assert_run_completed_once() {
     local expected_inode="${3:-}"
 
     local status tool_calls tool_results event_types effect_count
-    status="$(sql "SELECT status FROM agent_runs WHERE id = '$run_id';")"
-    tool_calls="$(sql "SELECT count(*) FROM events WHERE run_id = '$run_id' AND event_type = 'tool_call';")"
-    tool_results="$(sql "SELECT count(*) FROM events WHERE run_id = '$run_id' AND event_type = 'tool_result';")"
-    event_types="$(sql "SELECT string_agg(event_type, ',' ORDER BY seq) FROM events WHERE run_id = '$run_id';")"
+    status="$(sql "SELECT status FROM agent_runs WHERE lower(hex(id)) = '$run_id';")"
+    tool_calls="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_call';")"
+    tool_results="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_result';")"
+    event_types="$(sql "
+        SELECT group_concat(event_type, ',')
+        FROM (
+            SELECT event_type FROM events
+            WHERE lower(hex(run_id)) = '$run_id'
+            ORDER BY seq
+        );
+    ")"
     effect_count="$(find "$(dirname "$effect_file")" -maxdepth 1 -type f -name 'call_1.json' | wc -l | tr -d ' ')"
 
     [[ "$status" == "completed" ]] || fail "expected completed, got $status"
     [[ "$tool_calls" == "1" ]] || fail "expected 1 tool_call, got $tool_calls"
     [[ "$tool_results" == "1" ]] || fail "expected 1 tool_result, got $tool_results"
-    [[ "$event_types" == "llm_call,tool_call,tool_result,llm_call" ]] ||
+    [[ "$event_types" == "state_transition,llm_call,tool_call,tool_result,llm_call,state_transition" ]] ||
         fail "unexpected event order: $event_types"
     [[ "$effect_count" == "1" ]] || fail "expected one effect file, got $effect_count"
     if [[ -n "$expected_inode" ]]; then
@@ -134,6 +128,8 @@ run_case() {
 
     START_LOG="$case_dir/start.log"
     RESUME_LOG="$case_dir/resume.log"
+    DATABASE_PATH="$case_dir/zincir.db"
+    export ZINCIR_DATABASE_PATH="$DATABASE_PATH"
     export ZINCIR_OUTPUT_DIR="$case_dir"
     unset ZINCIR_RESUME ZINCIR_PAUSE_BEFORE_TOOL_MS ZINCIR_PAUSE_AFTER_TOOL_MS
 
@@ -142,8 +138,6 @@ run_case() {
     else
         export ZINCIR_PAUSE_AFTER_TOOL_MS=60000
     fi
-
-    reset_database
 
     echo "== starting $crash_point case =="
     "$BIN" >"$START_LOG" 2>&1 &
@@ -158,7 +152,7 @@ run_case() {
     CHILD_PID=""
 
     local status_before effect_inode=""
-    status_before="$(sql "SELECT status FROM agent_runs WHERE id = '$run_id';")"
+    status_before="$(sql "SELECT status FROM agent_runs WHERE lower(hex(id)) = '$run_id';")"
     [[ "$status_before" == "running" ]] ||
         fail "expected running before resume, got $status_before"
     if [[ -e "$effect_file" ]]; then
@@ -174,7 +168,6 @@ run_case() {
     assert_run_completed_once "$run_id" "$effect_file" "$effect_inode"
     effect_inode="$(file_inode "$effect_file")"
 
-    # A completed run must remain a no-op on subsequent resume attempts.
     if ! ZINCIR_RESUME=1 "$BIN" >>"$RESUME_LOG" 2>&1; then
         fail "second resume process failed"
     fi
@@ -183,13 +176,10 @@ run_case() {
     echo "PASS: $crash_point recovered without duplicating observable state"
 }
 
-echo "== checking dedicated test database =="
-sql "SELECT 1" >/dev/null || fail "cannot connect to $DB_URL"
-
 echo "== building zincir =="
 cargo build --quiet
 
 run_case before-effect
 run_case after-effect
 
-echo "PASS: all crash boundaries recovered"
+echo "PASS: all SQLite crash boundaries recovered"

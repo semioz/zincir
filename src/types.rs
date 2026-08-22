@@ -87,25 +87,25 @@ impl std::str::FromStr for EventType {
 
 macro_rules! impl_sqlx_text_enum {
     ($t:ty) => {
-        impl sqlx::Type<sqlx::Postgres> for $t {
-            fn type_info() -> sqlx::postgres::PgTypeInfo {
-                <&str as sqlx::Type<sqlx::Postgres>>::type_info()
+        impl sqlx::Type<sqlx::Sqlite> for $t {
+            fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+                <&str as sqlx::Type<sqlx::Sqlite>>::type_info()
             }
         }
-        impl<'q> sqlx::Encode<'q, sqlx::Postgres> for $t {
+        impl<'q> sqlx::Encode<'q, sqlx::Sqlite> for $t {
             fn encode_by_ref(
                 &self,
-                buf: &mut sqlx::postgres::PgArgumentBuffer,
+                arguments: &mut Vec<sqlx::sqlite::SqliteArgumentValue<'q>>,
             ) -> std::result::Result<sqlx::encode::IsNull, Box<dyn std::error::Error + Sync + Send>>
             {
-                self.as_str().encode_by_ref(buf)
+                self.as_str().encode_by_ref(arguments)
             }
         }
-        impl<'r> sqlx::Decode<'r, sqlx::Postgres> for $t {
+        impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for $t {
             fn decode(
-                value: sqlx::postgres::PgValueRef<'r>,
+                value: sqlx::sqlite::SqliteValueRef<'r>,
             ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-                let s = <&str as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+                let s = <&str as sqlx::Decode<sqlx::Sqlite>>::decode(value)?;
                 s.parse()
                     .map_err(|e: Error| -> Box<dyn std::error::Error + Sync + Send> { Box::new(e) })
             }
@@ -161,7 +161,7 @@ pub struct ToolResult {
 }
 
 // ---------------------------------------------------------------------------
-// Per-run config — stored in agent_runs.config JSONB, drives replay.
+// Per-run config — stored as JSON text in agent_runs.config, drives replay.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

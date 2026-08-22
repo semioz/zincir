@@ -8,7 +8,8 @@ mod types;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sqlx::postgres::PgPoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -18,10 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = PgPoolOptions::new()
+    let database_path =
+        PathBuf::from(std::env::var("ZINCIR_DATABASE_PATH").unwrap_or_else(|_| "zincir.db".into()));
+    let options = SqliteConnectOptions::new()
+        .filename(&database_path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&db_url)
+        .connect_with(options)
         .await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -71,7 +80,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn print_run(pool: &sqlx::PgPool, run_id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+async fn print_run(
+    pool: &sqlx::SqlitePool,
+    run_id: Uuid,
+) -> Result<(), Box<dyn std::error::Error>> {
     let run = db::get_run(pool, run_id).await?;
     tracing::info!(run_id = %run.id, status = ?run.status, "run");
     let events = db::get_events(pool, run.id).await?;

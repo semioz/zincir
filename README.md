@@ -2,13 +2,13 @@
 
 *A durable execution runtime for tool-using AI workflows.*
 
-Zincir is a Rust runtime that persists agent progress in Postgres so interrupted runs can reconstruct recorded state and continue. It is currently a single-node prototype, not a production workflow engine.
+Zincir is a Rust runtime that persists agent progress in a local SQLite database so interrupted runs can reconstruct recorded state and continue. It is a single-machine runtime, not a distributed workflow engine.
 
 ## Status
 
 v0.1 foundation:
 
-- The crate compiles and the single-agent stub loop runs against Postgres.
+- The crate compiles and the single-agent stub loop runs against a local SQLite file.
 - LLM responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs can reconstruct their conversation and resume.
 - Deterministic tests verify process-kill recovery both before and after the demo tool's atomic side effect.
@@ -33,7 +33,7 @@ On resume, Zincir rebuilds messages from the run configuration and recorded even
 
 ### Transactional event ordering
 
-Before assigning an event sequence, Zincir starts a Postgres transaction and locks the run row with `SELECT ... FOR UPDATE`. Writers for the same run wait their turn, so concurrent appends cannot choose the same sequence. Status changes update `agent_runs` and append their `state_transition` event in the same transaction.
+Before assigning an event sequence, Zincir starts a SQLite `BEGIN IMMEDIATE` transaction. SQLite allows one writer at a time, so sequence allocation and event insertion are atomic. Status changes update `agent_runs` and append their `state_transition` event in the same transaction. WAL mode allows readers to continue while a writer is active.
 
 ### Pending tool recovery
 
@@ -77,10 +77,10 @@ RunConfig + agent_runs
         │
         ├── LLMProvider
         ├── ToolExecutor
-        └── Postgres event log
+        └── SQLite event log
 ```
 
-Postgres contains three tables:
+SQLite contains three tables:
 
 - `agent_runs` — agent identity, parent, status, provider label, and configuration.
 - `events` — ordered replay history per run.
@@ -90,11 +90,16 @@ See `migrations/0001_init.sql` for the complete schema.
 
 ## Run the demo
 
-Requirements: Linux or macOS, Rust, and a running Postgres database.
+Requirements: Linux or macOS and Rust. No database server is required.
 
 ```bash
-createdb zincir
-DATABASE_URL=postgres://localhost/zincir RUST_LOG=info cargo run
+RUST_LOG=info cargo run
+```
+
+This creates `zincir.db` in the current directory. Use `ZINCIR_DATABASE_PATH` to place it elsewhere:
+
+```bash
+ZINCIR_DATABASE_PATH=~/.local/share/zincir/zincir.db RUST_LOG=info cargo run
 ```
 
 The demo:
@@ -110,28 +115,23 @@ The demo:
 To resume existing `pending` or `running` runs instead of creating a new one:
 
 ```bash
-DATABASE_URL=postgres://localhost/zincir ZINCIR_RESUME=1 RUST_LOG=info cargo run
+ZINCIR_RESUME=1 RUST_LOG=info cargo run
 ```
 
 `ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
 
 ## Crash recovery test
 
-The test uses a dedicated database named `zincir_test` and resets its `public` schema. It refuses to run against any other database name.
-
 ```bash
-createdb zincir_test
-ZINCIR_TEST_DATABASE_URL=postgres://localhost/zincir_test \
-  ./tests/crash_kill_resume.sh
+./tests/crash_kill_resume.sh
 ```
 
-The script builds Zincir and runs two scenarios. It kills the exact binary before the side effect, then repeats after the atomic side effect but before `tool_result` persistence. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
+The acceptance script requires the `sqlite3` CLI (preinstalled on macOS; install your distribution's SQLite package on Linux). It creates temporary SQLite databases, kills the exact binary before the side effect, then repeats after the atomic side effect but before `tool_result` persistence. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
 
-Postgres concurrency tests are ignored by the default test run because they create temporary databases. Run them explicitly with a database user that can create databases:
+SQLite concurrency tests run with the normal Rust suite:
 
 ```bash
-DATABASE_URL=postgres://postgres:postgres@localhost/zincir_test \
-  cargo test -- --ignored
+cargo test
 ```
 
 ## Durability contract
@@ -148,20 +148,21 @@ It does not currently guarantee:
 - Exactly-once external side effects.
 - That an in-progress provider call will not be repeated after a crash.
 - Deterministic re-generation by an LLM.
-- Distributed or concurrent ownership of the same run.
+- Distributed ownership of the same run across machines.
+- Concurrent runtime execution of the same run; SQLite serializes database writes but does not lease the full agent loop.
 
 ## Roadmap
 
-1. Add run leases before supporting concurrent workers.
+1. Add run leases before supporting concurrent runtime execution.
 2. Add real provider implementations.
 3. Add durable harness integrations such as OpenCode and Claude Code.
 4. Add multi-agent supervision and messaging.
-5. Add tracing, snapshots, and concurrency controls when measurements require them.
+5. Add tracing, snapshots, and a Postgres backend when multi-machine execution is needed.
 
 ## Non-goals for v1
 
 - Hosted service or visual workflow builder.
-- General distributed cluster.
+- General distributed cluster in the SQLite backend.
 - Automatic VM or GPU provisioning.
 - Guaranteeing exactly-once behavior for non-idempotent external systems.
 

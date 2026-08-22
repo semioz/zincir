@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
@@ -14,7 +14,7 @@ use crate::types::{EventType, RunConfig, RunStatus, ToolCall};
 
 // ---------------------------------------------------------------------------
 // Payload shapes stored in the events table. Local to the runtime — the
-// DB stores JSONB, these structs define the wire shape for serialize/replay.
+// SQLite stores JSON text; these structs define the wire shape for serialize/replay.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
@@ -42,13 +42,17 @@ struct ToolResultPayload {
 // ---------------------------------------------------------------------------
 
 pub struct Runtime {
-    pool: PgPool,
+    pool: SqlitePool,
     provider: Arc<dyn LLMProvider>,
     tools: Arc<dyn ToolExecutor>,
 }
 
 impl Runtime {
-    pub fn new(pool: PgPool, provider: Arc<dyn LLMProvider>, tools: Arc<dyn ToolExecutor>) -> Self {
+    pub fn new(
+        pool: SqlitePool,
+        provider: Arc<dyn LLMProvider>,
+        tools: Arc<dyn ToolExecutor>,
+    ) -> Self {
         Self {
             pool,
             provider,
