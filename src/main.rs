@@ -1,10 +1,3 @@
-mod db;
-mod error;
-mod provider;
-mod runtime;
-mod tool;
-mod types;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use zincir::{db, provider, runtime, tool, types};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

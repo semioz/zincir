@@ -173,6 +173,119 @@ async fn insert_event(
     .map_err(Into::into)
 }
 
+pub async fn claim_step(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    name: &str,
+    owner_id: Uuid,
+) -> Result<Option<Value>> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        current_status(&mut connection, run_id).await?;
+        let existing: Option<(String, Option<Value>)> =
+            sqlx::query_as("SELECT status, result FROM steps WHERE run_id = ? AND name = ?")
+                .bind(run_id)
+                .bind(name)
+                .fetch_optional(&mut *connection)
+                .await?;
+
+        match existing {
+            Some((status, Some(result))) if status == "completed" => Ok(Some(result)),
+            Some((status, _)) if status == "running" => Err(Error::InvalidState(format!(
+                "step {name:?} for run {run_id} is already running"
+            ))),
+            Some(_) => {
+                sqlx::query(
+                    "UPDATE steps
+                     SET status = 'running', owner_id = ?, started_at = CURRENT_TIMESTAMP
+                     WHERE run_id = ? AND name = ? AND status = 'pending'",
+                )
+                .bind(owner_id)
+                .bind(run_id)
+                .bind(name)
+                .execute(&mut *connection)
+                .await?;
+                Ok(None)
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO steps (run_id, name, status, owner_id)
+                     VALUES (?, ?, 'running', ?)",
+                )
+                .bind(run_id)
+                .bind(name)
+                .bind(owner_id)
+                .execute(&mut *connection)
+                .await?;
+                Ok(None)
+            }
+        }
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn complete_step(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    name: &str,
+    owner_id: Uuid,
+    result: &Value,
+) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let completion = async {
+        let rows = sqlx::query(
+            "UPDATE steps
+             SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP
+             WHERE run_id = ? AND name = ? AND status = 'running' AND owner_id = ?",
+        )
+        .bind(result)
+        .bind(run_id)
+        .bind(name)
+        .bind(owner_id)
+        .execute(&mut *connection)
+        .await?
+        .rows_affected();
+        if rows != 1 {
+            return Err(Error::InvalidState(format!(
+                "cannot complete step {name:?} for run {run_id}: claim was lost"
+            )));
+        }
+        Ok(())
+    }
+    .await;
+
+    finish_transaction(&mut connection, completion).await
+}
+
+/// Releases interrupted running steps after the caller has confirmed that the
+/// previous workflow process is no longer active.
+pub async fn recover_steps(pool: &SqlitePool, run_id: Uuid) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let recovery = async {
+        current_status(&mut connection, run_id).await?;
+        sqlx::query(
+            "UPDATE steps
+             SET status = 'pending', owner_id = NULL
+             WHERE run_id = ? AND status = 'running'",
+        )
+        .bind(run_id)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    finish_transaction(&mut connection, recovery).await
+}
+
 pub async fn get_events(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<Event>> {
     sqlx::query_as::<_, Event>("SELECT * FROM events WHERE run_id = ? ORDER BY seq")
         .bind(run_id)

@@ -63,6 +63,20 @@ pub trait ToolExecutor: Send + Sync {
 
 The demo binary currently wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Provider selection from stored configuration and real provider implementations are future work.
 
+### Durable named steps
+
+`WorkflowContext::step()` stores the completed JSON result for a named step. Repeating the same step name after a restart returns the saved value without rerunning its closure:
+
+```rust
+let report: String = ctx.step("generate-report", || async {
+    generate_report().await
+}).await?;
+```
+
+A second context is refused while a step is `running`; it cannot silently execute the same closure. After the caller has confirmed the previous workflow process is dead, call `ctx.recover().await?` to release unfinished steps before retrying them.
+
+Step closures with external side effects must still be idempotent: Zincir can crash after the effect completes but before its result is persisted.
+
 ### Multi-agent schema
 
 The schema includes parent/child run relationships and a durable `messages` table. The supervisor loop, message delivery, and fan-out/fan-in behavior are not implemented yet.
@@ -80,13 +94,14 @@ RunConfig + agent_runs
         └── SQLite event log
 ```
 
-SQLite contains three tables:
+SQLite contains four tables:
 
 - `agent_runs` — agent identity, parent, status, provider label, and configuration.
 - `events` — ordered replay history per run.
+- `steps` — named workflow step claims and completed JSON results.
 - `messages` — reserved for durable inter-agent messaging.
 
-See `migrations/0001_init.sql` for the complete schema.
+See `migrations/` for the complete schema.
 
 ## Run the demo
 
@@ -140,6 +155,7 @@ Zincir currently guarantees only what it records:
 
 - A unique, transactionally allocated event sequence within each run.
 - One durable tool intent per `(run_id, idempotency_key)`.
+- One persisted result per `(run_id, step name)`.
 - Replay of persisted LLM responses and tool results.
 - At-least-once recovery of tool intents without results.
 
