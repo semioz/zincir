@@ -143,6 +143,23 @@ pub struct Event {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct StepRecord {
+    pub name: String,
+    pub status: String,
+    pub owner_id: Option<Uuid>,
+    pub result: Option<Value>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct TimerRecord {
+    pub name: String,
+    pub wake_at_ms: i64,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 // ---------------------------------------------------------------------------
 // Tool primitives — shared by provider and tool modules
 // ---------------------------------------------------------------------------

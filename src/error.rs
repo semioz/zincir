@@ -13,6 +13,9 @@ pub enum Error {
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("tool error: {0}")]
     Tool(String),
 

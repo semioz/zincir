@@ -157,6 +157,20 @@ ZINCIR_RESUME=1 RUST_LOG=info cargo run
 
 `ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
 
+## Inspector UI
+
+Start the local, read-only run inspector:
+
+```bash
+cargo run -- ui
+```
+
+Open <http://127.0.0.1:8787>. It lists the latest 100 runs and shows each run's events, named steps, durable timers, and stored configuration. Set `ZINCIR_UI_ADDRESS` to use another loopback address or port; public network addresses are rejected.
+
+The Inspector opens SQLite read-only: it neither creates a database nor applies migrations. Run the demo or your application first to create and migrate the database.
+
+The Inspector deliberately has no Resume, Recover, or Cancel controls yet. Those actions need full run leases before they are safe to expose from a browser.
+
 ## Crash recovery test
 
 ```bash

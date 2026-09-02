@@ -6,7 +6,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::types::{AgentRun, Event, EventType, RunStatus};
+use crate::types::{AgentRun, Event, EventType, RunStatus, StepRecord, TimerRecord};
 
 pub async fn create_run(
     pool: &SqlitePool,
@@ -37,6 +37,34 @@ pub async fn get_run(pool: &SqlitePool, id: Uuid) -> Result<AgentRun> {
         .fetch_optional(pool)
         .await?
         .ok_or_else(|| Error::NotFound(format!("agent_run {id}")))
+}
+
+pub async fn list_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
+    sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs ORDER BY updated_at DESC LIMIT 100")
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn get_steps(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<StepRecord>> {
+    sqlx::query_as::<_, StepRecord>(
+        "SELECT name, status, owner_id, result, started_at, completed_at
+         FROM steps WHERE run_id = ? ORDER BY started_at",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn get_timers(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<TimerRecord>> {
+    sqlx::query_as::<_, TimerRecord>(
+        "SELECT name, wake_at_ms, completed_at FROM timers WHERE run_id = ? ORDER BY wake_at_ms",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
 }
 
 /// SQLite permits one writer at a time. BEGIN IMMEDIATE reserves that writer

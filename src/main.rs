@@ -5,7 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-use zincir::{db, provider, runtime, tool, types};
+use zincir::{db, provider, runtime, tool, types, ui};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_path =
         PathBuf::from(std::env::var("ZINCIR_DATABASE_PATH").unwrap_or_else(|_| "zincir.db".into()));
+    if std::env::args().nth(1).as_deref() == Some("ui") {
+        return ui::serve(&database_path).await.map_err(Into::into);
+    }
+
     let options = SqliteConnectOptions::new()
         .filename(&database_path)
         .create_if_missing(true)
