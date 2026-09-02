@@ -1,12 +1,23 @@
 # zincir
 
-*A durable execution runtime for tool-using AI workflows.*
+*A local-first durable execution SDK for teams building tool-using AI agents.*
 
-Zincir is a Rust runtime that persists agent progress in a local SQLite database so interrupted runs can reconstruct recorded state and continue. It is a single-machine runtime, not a distributed workflow engine.
+Zincir is a Rust runtime that persists agent progress in a local SQLite database so interrupted runs can reconstruct recorded state and continue. It is for teams that need coding agents, research agents, evaluation jobs, or internal LLM pipelines to survive process failure without repeating completed work. It is a single-machine runtime, not a distributed workflow engine.
+
+## Who it is for
+
+Use Zincir when an agent can call tools, make costly model requests, or run long enough that a process restart is a normal failure mode:
+
+- coding agents that modify repositories and run tests;
+- research or document-processing agents that call external APIs;
+- batch inference, evaluations, and data-preparation jobs;
+- internal agent platforms that need an inspectable local source of truth.
+
+Zincir is not yet the central, multi-machine workflow service for a company. It currently provides the durable local execution layer that such a platform can build on.
 
 ## Status
 
-v0.1 foundation:
+Current foundation:
 
 - The crate compiles and the single-agent stub loop runs against a local SQLite file.
 - LLM responses and tool intent/results are recorded in a per-run event log.
@@ -181,10 +192,10 @@ It does not currently guarantee:
 ## Roadmap
 
 1. Add run leases before supporting concurrent runtime execution.
-2. Add real provider implementations.
-3. Add durable harness integrations such as OpenCode and Claude Code.
-4. Add multi-agent supervision and messaging.
-5. Add tracing, snapshots, and a Postgres backend when multi-machine execution is needed.
+2. Scan and resume due durable timers in a worker loop.
+3. Add durable signals and human approval waits.
+4. Add real providers and harness integrations such as OpenCode and Claude Code.
+5. Add multi-agent supervision, tracing, and a Postgres backend when multi-machine execution is needed.
 
 ## Non-goals for v1
 
@@ -192,6 +203,7 @@ It does not currently guarantee:
 - General distributed cluster in the SQLite backend.
 - Automatic VM or GPU provisioning.
 - Guaranteeing exactly-once behavior for non-idempotent external systems.
+- Replacing a company's existing identity, secrets, observability, or deployment systems.
 
 ## License
 
