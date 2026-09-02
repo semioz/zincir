@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, time::Duration};
 
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::SqlitePool;
@@ -28,6 +28,18 @@ impl WorkflowContext {
         db::recover_steps(&self.pool, self.run_id).await
     }
 
+    /// Waits until a persisted absolute wake time. Resuming waits only the
+    /// remaining duration.
+    pub async fn sleep(&self, name: &str, delay: Duration) -> Result<()> {
+        validate_name(name)?;
+        let wake_at_ms = db::schedule_timer(&self.pool, self.run_id, name, delay).await?;
+        let remaining_ms = wake_at_ms.saturating_sub(chrono::Utc::now().timestamp_millis());
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms as u64)).await;
+        }
+        db::complete_timer(&self.pool, self.run_id, name).await
+    }
+
     /// Runs a named operation once, then reuses its persisted JSON result.
     /// The operation must be idempotent if it has external side effects.
     pub async fn step<T, F, Fut>(&self, name: &str, operation: F) -> Result<T>
@@ -36,7 +48,7 @@ impl WorkflowContext {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        validate_step_name(name)?;
+        validate_name(name)?;
         if let Some(result) = db::claim_step(&self.pool, self.run_id, name, self.owner_id).await? {
             return serde_json::from_value(result).map_err(Into::into);
         }
@@ -54,7 +66,7 @@ impl WorkflowContext {
     }
 }
 
-fn validate_step_name(name: &str) -> Result<()> {
+fn validate_name(name: &str) -> Result<()> {
     if !name.is_empty() && name.len() <= 255 {
         return Ok(());
     }
@@ -65,9 +77,12 @@ fn validate_step_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
     };
 
     use serde_json::json;
@@ -104,6 +119,22 @@ mod tests {
         .await
         .unwrap();
         (WorkflowContext::new(pool.clone(), run_id), run_id)
+    }
+
+    #[tokio::test]
+    async fn sleep_uses_the_saved_wake_time_after_a_new_context() {
+        let pool = test_pool().await;
+        let (_, run_id) = test_context(&pool).await;
+        db::schedule_timer(&pool, run_id, "nap", Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let context = WorkflowContext::new(pool, run_id);
+        let started = Instant::now();
+        context.sleep("nap", Duration::from_secs(60)).await.unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]

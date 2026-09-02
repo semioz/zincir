@@ -77,6 +77,16 @@ A second context is refused while a step is `running`; it cannot silently execut
 
 Step closures with external side effects must still be idempotent: Zincir can crash after the effect completes but before its result is persisted.
 
+### Durable sleep
+
+`WorkflowContext::sleep()` saves an absolute wake time before waiting:
+
+```rust
+ctx.sleep("rate-limit-backoff", Duration::from_secs(60)).await?;
+```
+
+A restarted context uses that saved timestamp and waits only the remaining time. This waits in the calling process; scanning and resuming due timers in a background worker is not implemented yet.
+
 ### Multi-agent schema
 
 The schema includes parent/child run relationships and a durable `messages` table. The supervisor loop, message delivery, and fan-out/fan-in behavior are not implemented yet.
@@ -94,11 +104,12 @@ RunConfig + agent_runs
         └── SQLite event log
 ```
 
-SQLite contains four tables:
+SQLite contains five tables:
 
 - `agent_runs` — agent identity, parent, status, provider label, and configuration.
 - `events` — ordered replay history per run.
 - `steps` — named workflow step claims and completed JSON results.
+- `timers` — named absolute wake times and completion timestamps.
 - `messages` — reserved for durable inter-agent messaging.
 
 See `migrations/` for the complete schema.

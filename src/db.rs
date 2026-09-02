@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use chrono::Utc;
 use serde_json::{json, Value};
 use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -263,6 +266,70 @@ pub async fn complete_step(
     finish_transaction(&mut connection, completion).await
 }
 
+fn duration_to_millis(delay: Duration) -> Result<i64> {
+    let milliseconds = delay.as_millis();
+    let rounded = if delay.subsec_nanos().is_multiple_of(1_000_000) {
+        milliseconds
+    } else {
+        milliseconds
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidState("timer delay is too large".into()))?
+    };
+    i64::try_from(rounded).map_err(|_| Error::InvalidState("timer delay is too large".into()))
+}
+
+pub async fn schedule_timer(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    name: &str,
+    delay: Duration,
+) -> Result<i64> {
+    let delay_ms = duration_to_millis(delay)?;
+    let wake_at_ms = Utc::now()
+        .timestamp_millis()
+        .checked_add(delay_ms)
+        .ok_or_else(|| Error::InvalidState("timer wake time is too large".into()))?;
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let timer = async {
+        current_status(&mut connection, run_id).await?;
+        if let Some(existing) =
+            sqlx::query_scalar("SELECT wake_at_ms FROM timers WHERE run_id = ? AND name = ?")
+                .bind(run_id)
+                .bind(name)
+                .fetch_optional(&mut *connection)
+                .await?
+        {
+            return Ok(existing);
+        }
+
+        sqlx::query("INSERT INTO timers (run_id, name, wake_at_ms) VALUES (?, ?, ?)")
+            .bind(run_id)
+            .bind(name)
+            .bind(wake_at_ms)
+            .execute(&mut *connection)
+            .await?;
+        Ok(wake_at_ms)
+    }
+    .await;
+
+    finish_transaction(&mut connection, timer).await
+}
+
+pub async fn complete_timer(pool: &SqlitePool, run_id: Uuid, name: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE timers
+         SET completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+         WHERE run_id = ? AND name = ?",
+    )
+    .bind(run_id)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Releases interrupted running steps after the caller has confirmed that the
 /// previous workflow process is no longer active.
 pub async fn recover_steps(pool: &SqlitePool, run_id: Uuid) -> Result<()> {
@@ -355,6 +422,13 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn timer_delays_round_up_to_a_millisecond() {
+        assert_eq!(duration_to_millis(Duration::from_nanos(1)).unwrap(), 1);
+        assert_eq!(duration_to_millis(Duration::from_millis(1)).unwrap(), 1);
+        assert_eq!(duration_to_millis(Duration::from_micros(1_001)).unwrap(), 2);
     }
 
     #[tokio::test]
