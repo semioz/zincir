@@ -6,7 +6,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::types::{AgentRun, Event, EventType, RunStatus, StepRecord, TimerRecord};
+use crate::types::{AgentRun, Event, EventType, RunLease, RunStatus, StepRecord, TimerRecord};
 
 pub async fn create_run(
     pool: &SqlitePool,
@@ -67,10 +67,139 @@ pub async fn get_timers(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<TimerReco
     .map_err(Into::into)
 }
 
+pub async fn acquire_run_lease(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    owner_id: Uuid,
+    ttl: Duration,
+) -> Result<RunLease> {
+    claim_run_lease(pool, run_id, owner_id, ttl, false).await
+}
+
+/// Explicit recovery fences the previous owner. The caller must first confirm
+/// that the process which held the lease is dead.
+pub async fn recover_run_lease(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    owner_id: Uuid,
+    ttl: Duration,
+) -> Result<RunLease> {
+    claim_run_lease(pool, run_id, owner_id, ttl, true).await
+}
+
+async fn claim_run_lease(
+    pool: &SqlitePool,
+    run_id: Uuid,
+    owner_id: Uuid,
+    ttl: Duration,
+    recover: bool,
+) -> Result<RunLease> {
+    let now_ms = Utc::now().timestamp_millis();
+    let expires_at_ms = now_ms
+        .checked_add(duration_to_millis(ttl)?)
+        .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        let status = current_status(&mut connection, run_id).await?;
+        if matches!(status, RunStatus::Completed | RunStatus::Failed) {
+            return Err(Error::InvalidState(format!(
+                "cannot lease terminal run {run_id}"
+            )));
+        }
+
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "UPDATE agent_runs
+             SET lease_owner = ?, lease_epoch = lease_epoch + 1,
+                 lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND (? OR lease_owner IS NULL)
+             RETURNING lease_epoch",
+        )
+        .bind(owner_id)
+        .bind(expires_at_ms)
+        .bind(run_id)
+        .bind(recover)
+        .fetch_optional(&mut *connection)
+        .await?;
+
+        let epoch = epoch.ok_or_else(|| {
+            Error::InvalidState(format!(
+                "run {run_id} already has an owner; explicit recovery required"
+            ))
+        })?;
+        Ok(RunLease {
+            run_id,
+            owner_id,
+            epoch,
+            expires_at_ms,
+        })
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn renew_run_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    ttl: Duration,
+) -> Result<RunLease> {
+    let now_ms = Utc::now().timestamp_millis();
+    let expires_at_ms = now_ms
+        .checked_add(duration_to_millis(ttl)?)
+        .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
+    let rows = sqlx::query(
+        "UPDATE agent_runs SET lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+           AND lease_expires_at_ms > ?",
+    )
+    .bind(expires_at_ms)
+    .bind(lease.run_id)
+    .bind(lease.owner_id)
+    .bind(lease.epoch)
+    .bind(now_ms)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        return Err(Error::InvalidState(format!(
+            "run lease {}:{} is no longer active",
+            lease.run_id, lease.epoch
+        )));
+    }
+    Ok(RunLease {
+        expires_at_ms,
+        ..*lease
+    })
+}
+
+pub async fn release_run_lease(pool: &SqlitePool, lease: &RunLease) -> Result<()> {
+    let rows = sqlx::query(
+        "UPDATE agent_runs
+         SET lease_owner = NULL, lease_expires_at_ms = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND lease_owner = ? AND lease_epoch = ?",
+    )
+    .bind(lease.run_id)
+    .bind(lease.owner_id)
+    .bind(lease.epoch)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        return Err(Error::InvalidState(format!(
+            "run lease {}:{} is no longer owned by this worker",
+            lease.run_id, lease.epoch
+        )));
+    }
+    Ok(())
+}
+
 /// SQLite permits one writer at a time. BEGIN IMMEDIATE reserves that writer
 /// slot before reading the next event sequence, so sequence allocation and
 /// insertion are one atomic operation.
-pub async fn update_run_status(pool: &SqlitePool, id: Uuid, status: RunStatus) -> Result<()> {
+#[cfg(test)]
+async fn update_run_status(pool: &SqlitePool, id: Uuid, status: RunStatus) -> Result<()> {
     let mut connection = pool.acquire().await?;
     begin_immediate(&mut connection).await?;
 
@@ -105,6 +234,46 @@ pub async fn update_run_status(pool: &SqlitePool, id: Uuid, status: RunStatus) -
     finish_transaction(&mut connection, result).await
 }
 
+pub async fn update_run_status_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    status: RunStatus,
+) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_run_lease(&mut connection, lease).await?;
+        let current = current_status(&mut connection, lease.run_id).await?;
+        if current == status {
+            return Ok(());
+        }
+
+        let seq = next_event_seq(&mut connection, lease.run_id).await?;
+        let payload = json!({ "from": current, "to": status });
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            seq,
+            EventType::StateTransition,
+            &payload,
+            None,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(status)
+        .bind(lease.run_id)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
 pub async fn list_inflight_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
     sqlx::query_as::<_, AgentRun>(
         "SELECT * FROM agent_runs
@@ -116,7 +285,8 @@ pub async fn list_inflight_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
     .map_err(Into::into)
 }
 
-pub async fn append_event(
+#[cfg(test)]
+async fn append_event(
     pool: &SqlitePool,
     run_id: Uuid,
     event_type: EventType,
@@ -142,6 +312,57 @@ pub async fn append_event(
     .await;
 
     finish_transaction(&mut connection, result).await
+}
+
+pub async fn append_event_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    event_type: EventType,
+    payload: &Value,
+    idempotency_key: Option<&str>,
+) -> Result<Event> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_run_lease(&mut connection, lease).await?;
+        let seq = next_event_seq(&mut connection, lease.run_id).await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            seq,
+            event_type,
+            payload,
+            idempotency_key,
+        )
+        .await
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+async fn validate_run_lease(connection: &mut SqliteConnection, lease: &RunLease) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_runs
+             WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+               AND lease_expires_at_ms > ?
+         )",
+    )
+    .bind(lease.run_id)
+    .bind(lease.owner_id)
+    .bind(lease.epoch)
+    .bind(Utc::now().timestamp_millis())
+    .fetch_one(connection)
+    .await?;
+    if !valid {
+        return Err(Error::InvalidState(format!(
+            "run lease {}:{} is no longer active",
+            lease.run_id, lease.epoch
+        )));
+    }
+    Ok(())
 }
 
 async fn begin_immediate(connection: &mut SqliteConnection) -> Result<()> {
@@ -457,6 +678,160 @@ mod tests {
         assert_eq!(duration_to_millis(Duration::from_nanos(1)).unwrap(), 1);
         assert_eq!(duration_to_millis(Duration::from_millis(1)).unwrap(), 1);
         assert_eq!(duration_to_millis(Duration::from_micros(1_001)).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_run_lease_blocks_another_owner() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let owner = Uuid::new_v4();
+
+        let lease = acquire_run_lease(&pool, run.id, owner, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let error = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap_err();
+
+        assert_eq!(lease.run_id, run.id);
+        assert_eq!(lease.owner_id, owner);
+        assert_eq!(lease.epoch, 1);
+        assert!(matches!(error, Error::InvalidState(_)));
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_owned_lease_requires_explicit_recovery() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let first = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET lease_expires_at_ms = 0 WHERE id = ?")
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let blocked = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        let recovered = recover_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert!(matches!(blocked, Error::InvalidState(_)));
+        assert_eq!(recovered.epoch, first.epoch + 1);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_run_lease_can_be_renewed() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let renewed = renew_run_lease(&pool, &lease, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert_eq!(renewed.epoch, lease.epoch);
+        assert!(renewed.expires_at_ms > lease.expires_at_ms);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_run_lease_can_be_acquired_by_another_owner() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let first = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        release_run_lease(&pool, &first).await.unwrap();
+        let second = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(second.epoch, first.epoch + 1);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_lease_fences_writes_from_the_previous_owner() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let first = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET lease_expires_at_ms = 0 WHERE id = ?")
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = recover_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let stale = append_event_with_lease(
+            &pool,
+            &first,
+            EventType::LlmCall,
+            &json!({ "writer": "stale" }),
+            None,
+        )
+        .await
+        .unwrap_err();
+        append_event_with_lease(
+            &pool,
+            &second,
+            EventType::LlmCall,
+            &json!({ "writer": "current" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.epoch, first.epoch + 1);
+        assert!(matches!(stale, Error::InvalidState(_)));
+        assert_eq!(get_events(&pool, run.id).await.unwrap().len(), 1);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_run_lease_cannot_change_status() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let first = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET lease_expires_at_ms = 0 WHERE id = ?")
+            .bind(run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        recover_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let error = update_run_status_with_lease(&pool, &first, RunStatus::Running)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidState(_)));
+        assert_eq!(
+            get_run(&pool, run.id).await.unwrap().status,
+            RunStatus::Pending
+        );
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

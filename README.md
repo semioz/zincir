@@ -1,8 +1,8 @@
 # zincir
 
-*A local-first durable execution SDK for teams building tool-using AI agents.*
+*A local-first durable, verified execution substrate for long-horizon AI agents.*
 
-Zincir is a Rust runtime that persists agent progress in a local SQLite database so interrupted runs can reconstruct recorded state and continue. It is for teams that need coding agents, research agents, evaluation jobs, or internal LLM pipelines to survive process failure without repeating completed work. It is a single-machine runtime, not a distributed workflow engine.
+Zincir is a Rust runtime that persists agent execution in local SQLite so interrupted runs can recover without blindly repeating completed work. Its goal is to keep the event log as ground truth while giving each fresh agent context a compact view of verified progress. It is a single-machine runtime, not an intelligent agent or distributed workflow engine.
 
 ## Who it is for
 
@@ -13,7 +13,32 @@ Use Zincir when an agent can call tools, make costly model requests, or run long
 - batch inference, evaluations, and data-preparation jobs;
 - internal agent platforms that need an inspectable local source of truth.
 
-Zincir is not yet the central, multi-machine workflow service for a company. It currently provides the durable local execution layer that such a platform can build on.
+Zincir is not yet the central, multi-machine workflow service for a company. It provides the durable local execution layer that such a platform can build on.
+
+## Direction: durable, verified rounds
+
+Process durability is necessary but insufficient for long-horizon work. An agent can remain alive while its growing conversation becomes noisy, contradictory, or confused. Zincir is evolving toward execution in bounded rounds:
+
+```text
+original goal
+     │
+     ▼
+agent round ── tool calls ──► checkpoint candidate
+                                      │
+                              independent verification
+                                ┌─────┴─────┐
+                             accepted    rejected
+                                │           │
+                                ▼           ▼
+                      durable progress   retry/replan
+                                │
+                                ▼
+                       fresh agent context
+```
+
+The append-only event log remains authoritative. An accepted checkpoint is an agent-facing semantic view containing completed work, remaining work, artifacts, failed attempts, and evidence. Fresh rounds should start from the original goal and the latest accepted checkpoint rather than replaying an indefinitely growing conversation.
+
+A checkpoint must not become trusted merely because the executor produced it. Acceptance should record the verifier decision, supporting evidence, artifact identity, and lineage to the event sequence it summarizes.
 
 ## Status
 
@@ -22,6 +47,7 @@ Current foundation:
 - The crate compiles and the single-agent stub loop runs against a local SQLite file.
 - LLM responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs can reconstruct their conversation and resume.
+- Expiring run leases and fencing tokens prevent concurrent runtimes from persisting work for the same run.
 - Deterministic tests verify process-kill recovery both before and after the demo tool's atomic side effect.
 - Multi-agent coordination, real providers, harness integrations, and sandboxing are not implemented.
 
@@ -155,7 +181,7 @@ To resume existing `pending` or `running` runs instead of creating a new one:
 ZINCIR_RESUME=1 RUST_LOG=info cargo run
 ```
 
-`ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
+Explicit resume fences the previous lease owner, so use it only after confirming that the previous process is dead. `ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
 
 ## Inspector UI
 
@@ -201,20 +227,27 @@ It does not currently guarantee:
 - That an in-progress provider call will not be repeated after a crash.
 - Deterministic re-generation by an LLM.
 - Distributed ownership of the same run across machines.
-- Concurrent runtime execution of the same run; SQLite serializes database writes but does not lease the full agent loop.
+- Continuous lease heartbeats during provider or tool calls longer than five minutes.
 
 ## Roadmap
 
-1. Add run leases before supporting concurrent runtime execution.
-2. Scan and resume due durable timers in a worker loop.
-3. Add durable signals and human approval waits.
-4. Add real providers and harness integrations such as OpenCode and Claude Code.
-5. Add multi-agent supervision, tracing, and a Postgres backend when multi-machine execution is needed.
+1. Add an automatic resume worker and continuous lease heartbeats.
+2. Add one real coding-agent integration with observable round and tool boundaries.
+3. Add checkpoint candidates, independent verification, and accepted checkpoint lineage.
+4. Start fresh agent contexts from the original goal and latest accepted checkpoint.
+5. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
+6. Add durable signals and human approval waits.
+7. Add child runs and durable spawn/join after the single-agent path is proven.
+8. Add Postgres only when multi-machine execution is required.
+
+The target demonstration is a test-backed repository task that survives an injected process kill, restores verified progress, continues in a fresh context, and completes without duplicating external effects. The accompanying benchmark will vary three dimensions independently: crash durability, context strategy, and verification policy.
 
 ## Non-goals for v1
 
+- Being the planner or intelligence of the long-horizon agent.
 - Hosted service or visual workflow builder.
 - General distributed cluster in the SQLite backend.
+- Generic multi-agent orchestration before the single-agent recovery path is proven.
 - Automatic VM or GPU provisioning.
 - Guaranteeing exactly-once behavior for non-idempotent external systems.
 - Replacing a company's existing identity, secrets, observability, or deployment systems.

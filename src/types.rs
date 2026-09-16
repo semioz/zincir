@@ -143,6 +143,14 @@ pub struct Event {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLease {
+    pub run_id: Uuid,
+    pub owner_id: Uuid,
+    pub epoch: i64,
+    pub expires_at_ms: i64,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct StepRecord {
     pub name: String,
