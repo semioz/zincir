@@ -54,6 +54,9 @@ pub enum EventType {
     ToolCall,
     ToolResult,
     StateTransition,
+    CheckpointProposed,
+    CheckpointAccepted,
+    CheckpointRejected,
 }
 
 impl EventType {
@@ -63,6 +66,9 @@ impl EventType {
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
             Self::StateTransition => "state_transition",
+            Self::CheckpointProposed => "checkpoint_proposed",
+            Self::CheckpointAccepted => "checkpoint_accepted",
+            Self::CheckpointRejected => "checkpoint_rejected",
         }
     }
 }
@@ -75,6 +81,9 @@ impl std::str::FromStr for EventType {
             "tool_call" => Ok(Self::ToolCall),
             "tool_result" => Ok(Self::ToolResult),
             "state_transition" => Ok(Self::StateTransition),
+            "checkpoint_proposed" => Ok(Self::CheckpointProposed),
+            "checkpoint_accepted" => Ok(Self::CheckpointAccepted),
+            "checkpoint_rejected" => Ok(Self::CheckpointRejected),
             other => Err(Error::InvalidState(format!("unknown event type: {other}"))),
         }
     }
@@ -151,6 +160,30 @@ pub struct RunLease {
     pub expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub completed: Vec<String>,
+    pub remaining: Vec<String>,
+    pub artifacts: Vec<String>,
+    pub failed_attempts: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct CheckpointRecord {
+    pub id: i64,
+    pub run_id: Uuid,
+    pub round: i32,
+    pub tool_call_id: String,
+    pub based_on_event_seq: i32,
+    pub decision_event_seq: Option<i32>,
+    pub status: String,
+    pub state: Value,
+    pub verification: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct StepRecord {
     pub name: String,
@@ -200,4 +233,6 @@ pub struct RunConfig {
     pub input: String,
     #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub verification_command: Vec<String>,
 }

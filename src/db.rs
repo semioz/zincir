@@ -6,7 +6,10 @@ use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::types::{AgentRun, Event, EventType, RunLease, RunStatus, StepRecord, TimerRecord};
+use crate::types::{
+    AgentRun, CheckpointRecord, CheckpointState, Event, EventType, RunLease, RunStatus, StepRecord,
+    TimerRecord,
+};
 
 pub async fn create_run(
     pool: &SqlitePool,
@@ -274,6 +277,173 @@ pub async fn update_run_status_with_lease(
     finish_transaction(&mut connection, result).await
 }
 
+pub async fn propose_checkpoint_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    tool_call_id: &str,
+    state: &CheckpointState,
+) -> Result<CheckpointRecord> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_run_lease(&mut connection, lease).await?;
+        let pending: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM checkpoints WHERE run_id = ? AND status = 'candidate'
+             )",
+        )
+        .bind(lease.run_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if pending {
+            return Err(Error::InvalidState(format!(
+                "run {} already has a checkpoint candidate",
+                lease.run_id
+            )));
+        }
+
+        let round: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(round), 0) + 1 FROM checkpoints WHERE run_id = ?",
+        )
+        .bind(lease.run_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        let proposed_event_seq = next_event_seq(&mut connection, lease.run_id).await?;
+        let based_on_event_seq = proposed_event_seq - 1;
+        let state = serde_json::to_value(state)?;
+        let checkpoint = sqlx::query_as::<_, CheckpointRecord>(
+            "INSERT INTO checkpoints (
+                 run_id, round, tool_call_id, based_on_event_seq, status, state
+             ) VALUES (?, ?, ?, ?, 'candidate', ?)
+             RETURNING *",
+        )
+        .bind(lease.run_id)
+        .bind(round)
+        .bind(tool_call_id)
+        .bind(based_on_event_seq)
+        .bind(&state)
+        .fetch_one(&mut *connection)
+        .await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            proposed_event_seq,
+            EventType::CheckpointProposed,
+            &json!({ "checkpoint_id": checkpoint.id, "round": round, "state": state }),
+            Some(&format!("checkpoint:{}:proposed", checkpoint.id)),
+        )
+        .await?;
+        Ok(checkpoint)
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn decide_checkpoint_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    checkpoint_id: i64,
+    accepted: bool,
+    verification: &Value,
+) -> Result<CheckpointRecord> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_run_lease(&mut connection, lease).await?;
+        let candidate = sqlx::query_as::<_, CheckpointRecord>(
+            "SELECT * FROM checkpoints
+             WHERE id = ? AND run_id = ? AND status = 'candidate'",
+        )
+        .bind(checkpoint_id)
+        .bind(lease.run_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidState(format!(
+                "checkpoint {checkpoint_id} is not an active candidate"
+            ))
+        })?;
+        let status = if accepted { "accepted" } else { "rejected" };
+        let event_type = if accepted {
+            EventType::CheckpointAccepted
+        } else {
+            EventType::CheckpointRejected
+        };
+        let decision_event_seq = next_event_seq(&mut connection, lease.run_id).await?;
+        let checkpoint = sqlx::query_as::<_, CheckpointRecord>(
+            "UPDATE checkpoints
+             SET status = ?, verification = ?, decision_event_seq = ?,
+                 decided_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND status = 'candidate'
+             RETURNING *",
+        )
+        .bind(status)
+        .bind(verification)
+        .bind(decision_event_seq)
+        .bind(checkpoint_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            decision_event_seq,
+            event_type,
+            &json!({ "checkpoint_id": checkpoint_id, "verification": verification }),
+            Some(&format!("checkpoint:{checkpoint_id}:{status}")),
+        )
+        .await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            decision_event_seq + 1,
+            EventType::ToolResult,
+            &json!({
+                "call_id": candidate.tool_call_id,
+                "content": { "accepted": accepted, "verification": verification }
+            }),
+            Some(&format!("checkpoint:{checkpoint_id}:tool_result")),
+        )
+        .await?;
+        Ok(checkpoint)
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn get_pending_checkpoint(
+    pool: &SqlitePool,
+    run_id: Uuid,
+) -> Result<Option<CheckpointRecord>> {
+    sqlx::query_as::<_, CheckpointRecord>(
+        "SELECT * FROM checkpoints
+         WHERE run_id = ? AND status = 'candidate'
+         ORDER BY round DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn get_latest_accepted_checkpoint(
+    pool: &SqlitePool,
+    run_id: Uuid,
+) -> Result<Option<CheckpointRecord>> {
+    sqlx::query_as::<_, CheckpointRecord>(
+        "SELECT * FROM checkpoints
+         WHERE run_id = ? AND status = 'accepted'
+         ORDER BY round DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
 pub async fn list_inflight_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
     sqlx::query_as::<_, AgentRun>(
         "SELECT * FROM agent_runs
@@ -308,6 +478,46 @@ async fn append_event(
             idempotency_key,
         )
         .await
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn append_llm_call_with_tool_intents_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    llm_payload: &Value,
+    tool_intents: &[(Value, String)],
+) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_run_lease(&mut connection, lease).await?;
+        let mut seq = next_event_seq(&mut connection, lease.run_id).await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            seq,
+            EventType::LlmCall,
+            llm_payload,
+            None,
+        )
+        .await?;
+        for (payload, idempotency_key) in tool_intents {
+            seq += 1;
+            insert_event(
+                &mut connection,
+                lease.run_id,
+                seq,
+                EventType::ToolCall,
+                payload,
+                Some(idempotency_key),
+            )
+            .await?;
+        }
+        Ok(())
     }
     .await;
 
@@ -678,6 +888,98 @@ mod tests {
         assert_eq!(duration_to_millis(Duration::from_nanos(1)).unwrap(), 1);
         assert_eq!(duration_to_millis(Duration::from_millis(1)).unwrap(), 1);
         assert_eq!(duration_to_millis(Duration::from_micros(1_001)).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_response_and_tool_intents_are_appended_atomically() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        let intents = vec![
+            (
+                json!({ "call_id": "call_1", "name": "one", "args": {} }),
+                "call_1".into(),
+            ),
+            (
+                json!({ "call_id": "call_2", "name": "two", "args": {} }),
+                "call_2".into(),
+            ),
+        ];
+
+        append_llm_call_with_tool_intents_with_lease(
+            &pool,
+            &lease,
+            &json!({ "content": "tools", "tool_calls": [], "stop_reason": "tool_use" }),
+            &intents,
+        )
+        .await
+        .unwrap();
+
+        let events = get_events(&pool, run.id).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, EventType::LlmCall);
+        assert_eq!(events[1].event_type, EventType::ToolCall);
+        assert_eq!(events[2].event_type, EventType::ToolCall);
+        assert_eq!(events[1].idempotency_key.as_deref(), Some("call_1"));
+        assert_eq!(events[2].idempotency_key.as_deref(), Some("call_2"));
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_checkpoint_records_evidence_and_event_lineage() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        append_event_with_lease(
+            &pool,
+            &lease,
+            EventType::LlmCall,
+            &json!({ "content": "checkpoint" }),
+            None,
+        )
+        .await
+        .unwrap();
+        let state = crate::types::CheckpointState {
+            completed: vec!["inspected repository".into()],
+            remaining: vec!["implement change".into()],
+            artifacts: vec!["git:abc123".into()],
+            failed_attempts: vec![],
+            evidence: vec!["cargo test".into()],
+        };
+
+        let candidate = propose_checkpoint_with_lease(&pool, &lease, "checkpoint_1", &state)
+            .await
+            .unwrap();
+        let accepted = decide_checkpoint_with_lease(
+            &pool,
+            &lease,
+            candidate.id,
+            true,
+            &json!({ "command": ["cargo", "test"], "exit_code": 0 }),
+        )
+        .await
+        .unwrap();
+        let latest = get_latest_accepted_checkpoint(&pool, run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = get_events(&pool, run.id).await.unwrap();
+
+        assert_eq!(accepted.status, "accepted");
+        assert_eq!(latest.id, accepted.id);
+        assert_eq!(latest.state, serde_json::to_value(state).unwrap());
+        assert_eq!(latest.based_on_event_seq, 0);
+        assert_eq!(latest.decision_event_seq, Some(2));
+        assert_eq!(events[1].event_type, EventType::CheckpointProposed);
+        assert_eq!(events[2].event_type, EventType::CheckpointAccepted);
+        assert_eq!(events[3].event_type, EventType::ToolResult);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

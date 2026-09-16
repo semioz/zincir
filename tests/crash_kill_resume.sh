@@ -92,10 +92,11 @@ assert_run_completed_once() {
     local effect_file="$2"
     local expected_inode="${3:-}"
 
-    local status tool_calls tool_results event_types effect_count
+    local status tool_calls tool_results accepted_checkpoints event_types effect_count
     status="$(sql "SELECT status FROM agent_runs WHERE lower(hex(id)) = '$run_id';")"
     tool_calls="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_call';")"
     tool_results="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_result';")"
+    accepted_checkpoints="$(sql "SELECT count(*) FROM checkpoints WHERE lower(hex(run_id)) = '$run_id' AND status = 'accepted';")"
     event_types="$(sql "
         SELECT group_concat(event_type, ',')
         FROM (
@@ -107,9 +108,10 @@ assert_run_completed_once() {
     effect_count="$(find "$(dirname "$effect_file")" -maxdepth 1 -type f -name 'call_1.json' | wc -l | tr -d ' ')"
 
     [[ "$status" == "completed" ]] || fail "expected completed, got $status"
-    [[ "$tool_calls" == "1" ]] || fail "expected 1 tool_call, got $tool_calls"
-    [[ "$tool_results" == "1" ]] || fail "expected 1 tool_result, got $tool_results"
-    [[ "$event_types" == "state_transition,llm_call,tool_call,tool_result,llm_call,state_transition" ]] ||
+    [[ "$tool_calls" == "2" ]] || fail "expected 2 tool_calls, got $tool_calls"
+    [[ "$tool_results" == "2" ]] || fail "expected 2 tool_results, got $tool_results"
+    [[ "$accepted_checkpoints" == "1" ]] || fail "expected 1 accepted checkpoint, got $accepted_checkpoints"
+    [[ "$event_types" == "state_transition,llm_call,tool_call,tool_result,llm_call,tool_call,checkpoint_proposed,checkpoint_accepted,tool_result,state_transition" ]] ||
         fail "unexpected event order: $event_types"
     [[ "$effect_count" == "1" ]] || fail "expected one effect file, got $effect_count"
     if [[ -n "$expected_inode" ]]; then

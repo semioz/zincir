@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             system: "You are a test agent.".into(),
             input: "Write hello to the file.".into(),
             tools: vec!["write_file".into()],
+            verification_command: vec!["true".into()],
         };
 
         let run = db::create_run(

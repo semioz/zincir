@@ -48,6 +48,8 @@ Current foundation:
 - LLM responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs can reconstruct their conversation and resume.
 - Expiring run leases and fencing tokens prevent concurrent runtimes from persisting work for the same run.
+- Agents submit semantic checkpoint candidates that a configured command verifies independently.
+- Accepted checkpoints start fresh contexts from the original goal and verified progress.
 - Deterministic tests verify process-kill recovery both before and after the demo tool's atomic side effect.
 - Multi-agent coordination, real providers, harness integrations, and sandboxing are not implemented.
 
@@ -65,8 +67,9 @@ The runtime treats `events` as an append-only, sequence-ordered log:
 - `tool_call` records tool intent before execution.
 - `tool_result` records the returned result after execution.
 - `state_transition` records status changes such as `pending → running` and `running → completed`.
+- `checkpoint_proposed`, `checkpoint_accepted`, and `checkpoint_rejected` record checkpoint lineage and verifier decisions.
 
-On resume, Zincir rebuilds messages from the run configuration and recorded events.
+On resume, Zincir resolves unfinished checkpoint candidates and rebuilds messages from the latest accepted checkpoint plus subsequent events.
 
 ### Transactional event ordering
 
@@ -99,6 +102,18 @@ pub trait ToolExecutor: Send + Sync {
 ```
 
 The demo binary currently wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Provider selection from stored configuration and real provider implementations are future work.
+
+### Verified semantic checkpoints
+
+The runtime advertises a built-in `submit_checkpoint` tool with completed work, remaining work, artifacts, failed attempts, and evidence. Zincir persists the candidate before running the configured verifier command. A zero exit status accepts it; any other exit status rejects it and returns the verifier output to the agent for replanning.
+
+The verifier receives the proposed state in `ZINCIR_CHECKPOINT_JSON`. It is configured as a program and argument vector, without shell interpolation:
+
+```rust
+verification_command: vec!["cargo".into(), "test".into()],
+```
+
+An accepted checkpoint with remaining work starts a fresh model context containing the original goal and checkpoint state. An accepted checkpoint with no remaining work completes the run. A candidate left unfinished by a crash is verified during explicit resume.
 
 ### Durable named steps
 
@@ -138,13 +153,15 @@ RunConfig + agent_runs
         │
         ├── LLMProvider
         ├── ToolExecutor
-        └── SQLite event log
+        ├── command verifier
+        └── SQLite events + checkpoints
 ```
 
-SQLite contains five tables:
+SQLite contains six tables:
 
-- `agent_runs` — agent identity, parent, status, provider label, and configuration.
-- `events` — ordered replay history per run.
+- `agent_runs` — agent identity, parent, status, provider label, configuration, and lease state.
+- `events` — ordered replay and checkpoint history per run.
+- `checkpoints` — semantic state, verification result, status, and event lineage per round.
 - `steps` — named workflow step claims and completed JSON results.
 - `timers` — named absolute wake times and completion timestamps.
 - `messages` — reserved for durable inter-agent messaging.
@@ -172,8 +189,10 @@ The demo:
 3. Records the tool intent.
 4. Atomically publishes `output/call_1.json`.
 5. Records the tool result.
-6. Calls the stub provider again and completes the run.
-7. Prints that run and its event log.
+6. Calls the stub provider again, which submits a checkpoint candidate.
+7. Runs the configured verifier and accepts the checkpoint.
+8. Completes the run because the verified checkpoint has no remaining work.
+9. Prints that run and its event log.
 
 To resume existing `pending` or `running` runs instead of creating a new one:
 
@@ -195,7 +214,7 @@ Open <http://127.0.0.1:8787>. It lists the latest 100 runs and shows each run's 
 
 The Inspector opens SQLite read-only: it neither creates a database nor applies migrations. Run the demo or your application first to create and migrate the database.
 
-The Inspector deliberately has no Resume, Recover, or Cancel controls yet. Those actions need full run leases before they are safe to expose from a browser.
+The Inspector deliberately has no Resume, Recover, or Cancel controls yet. Those actions need an explicit recovery policy and authorization before they are safe to expose from a browser.
 
 ## Crash recovery test
 
@@ -220,6 +239,8 @@ Zincir currently guarantees only what it records:
 - One persisted result per `(run_id, step name)`.
 - Replay of persisted LLM responses and tool results.
 - At-least-once recovery of tool intents without results.
+- Transactional checkpoint proposal/decision events and one verifier result per checkpoint.
+- Fresh-context continuation from the latest accepted checkpoint.
 
 It does not currently guarantee:
 
@@ -233,12 +254,11 @@ It does not currently guarantee:
 
 1. Add an automatic resume worker and continuous lease heartbeats.
 2. Add one real coding-agent integration with observable round and tool boundaries.
-3. Add checkpoint candidates, independent verification, and accepted checkpoint lineage.
-4. Start fresh agent contexts from the original goal and latest accepted checkpoint.
-5. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
-6. Add durable signals and human approval waits.
-7. Add child runs and durable spawn/join after the single-agent path is proven.
-8. Add Postgres only when multi-machine execution is required.
+3. Bind coding checkpoints to a generated workspace revision instead of agent-supplied artifact labels.
+4. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
+5. Add durable signals and human approval waits.
+6. Add child runs and durable spawn/join after the single-agent path is proven.
+7. Add Postgres only when multi-machine execution is required.
 
 The target demonstration is a test-backed repository task that survives an injected process kill, restores verified progress, continues in a fresh context, and completes without duplicating external effects. The accompanying benchmark will vary three dimensions independently: crash durability, context strategy, and verification policy.
 

@@ -93,9 +93,19 @@ impl LLMProvider for StubProvider {
 
         if seen_tool_result {
             return Ok(Response {
-                content: json!("Done. Wrote the file."),
-                tool_calls: vec![],
-                stop_reason: "stop".into(),
+                content: json!("The requested work is complete."),
+                tool_calls: vec![ToolCall {
+                    id: "checkpoint_1".into(),
+                    name: "submit_checkpoint".into(),
+                    args: json!({
+                        "completed": ["Wrote the requested file"],
+                        "remaining": [],
+                        "artifacts": ["output/call_1.json"],
+                        "failed_attempts": [],
+                        "evidence": ["write_file returned ok"]
+                    }),
+                }],
+                stop_reason: "tool_use".into(),
             });
         }
 
