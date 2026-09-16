@@ -1,6 +1,6 @@
 # zincir
 
-*A local-first durable, verified execution substrate for long-horizon AI agents.*
+Durable, resumable execution for long-horizon AI agents.
 
 Zincir is a Rust runtime that persists agent execution in local SQLite so interrupted runs can recover without blindly repeating completed work. Its goal is to keep the event log as ground truth while giving each fresh agent context a compact view of verified progress. It is a single-machine runtime, not an intelligent agent or distributed workflow engine.
 
