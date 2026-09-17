@@ -3,7 +3,7 @@ name = "zincir"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A durable execution runtime for multi-agent, tool-using AI workflows. Working name — rename before publishing."
+description = "An embedded durable execution SDK for long-horizon AI agents."
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

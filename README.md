@@ -2,11 +2,11 @@
 
 Durable, resumable execution for long-horizon AI agents.
 
-Zincir is a Rust runtime that persists agent execution in local SQLite so interrupted runs can recover without blindly repeating completed work. Its goal is to keep the event log as ground truth while giving each fresh agent context a compact view of verified progress. It is a single-machine runtime, not an intelligent agent or distributed workflow engine.
+Zincir is an embedded Rust SDK for developers building their own long-horizon agents. Bring your own model client, tools, prompts, and agent loop; Zincir persists execution in local SQLite so interrupted runs can recover without blindly repeating completed work. It keeps the event log as ground truth while exposing verified progress for fresh contexts. It is a single-machine durability layer, not an agent framework or distributed workflow engine.
 
 ## Who it is for
 
-Use Zincir when an agent can call tools, make costly model requests, or run long enough that a process restart is a normal failure mode:
+Use Zincir when you are implementing an agent that can call tools, make costly model requests, or run long enough that a process restart is a normal failure mode:
 
 - coding agents that modify repositories and run tests;
 - research or document-processing agents that call external APIs;
@@ -44,7 +44,8 @@ A checkpoint must not become trusted merely because the executor produced it. Ac
 
 Current foundation:
 
-- The crate compiles and the single-agent stub loop runs against a local SQLite file.
+- `AgentContext` lets custom agent loops record responses, recover tools, verify checkpoints, and reconstruct durable state.
+- The crate also includes a small reference runner with a stub model and tool.
 - LLM responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs can reconstruct their conversation and resume.
 - Expiring run leases and fencing tokens prevent concurrent runtimes from persisting work for the same run.
@@ -81,9 +82,30 @@ A `tool_call` without a matching `tool_result` is considered pending and is exec
 
 Effect-once behavior requires cooperation from the tool: it must be idempotent, transactional with its destination, or enforce the supplied tool-call ID as an idempotency key. Zincir cannot make arbitrary external side effects exactly-once by itself.
 
-### Provider and tool boundaries
+### Embedded agent SDK
 
-The runtime depends on two traits:
+`AgentContext` owns the durable run lease while your application owns the loop. It can create or recover a run, atomically record a model response with all tool intents, list pending tools, persist tool results, submit or resume checkpoint verification, expose state after the latest accepted checkpoint, and complete or release the run.
+
+```rust
+let mut ctx = AgentContext::create(
+    pool,
+    None,
+    "research-agent",
+    "my-provider",
+    serde_json::json!({ "goal": "Compare the proposals" }),
+    Duration::from_secs(30),
+).await?;
+
+let durable = ctx.state().await?;
+let response = my_agent.run(durable).await?;
+ctx.record_response(response.content, &response.tool_calls, "tool_use").await?;
+```
+
+Checkpoint verification is supplied by application code as an async closure. If it is interrupted after the candidate is persisted, `AgentContext::recover()` and `pending_checkpoint()` expose it for another verification attempt.
+
+### Reference runner
+
+The bundled demo runner is optional example code built around two traits:
 
 ```rust
 #[async_trait]
@@ -101,11 +123,13 @@ pub trait ToolExecutor: Send + Sync {
 }
 ```
 
-The demo binary currently wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Provider selection from stored configuration and real provider implementations are future work.
+The demo binary wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Applications using `AgentContext` do not need to implement either trait; they can use their existing model and tool code.
 
 ### Verified semantic checkpoints
 
-The runtime advertises a built-in `submit_checkpoint` tool with completed work, remaining work, artifacts, failed attempts, and evidence. Zincir persists the candidate before running the configured verifier command. A zero exit status accepts it; any other exit status rejects it and returns the verifier output to the agent for replanning.
+A custom loop submits completed work, remaining work, artifacts, failed attempts, and evidence through `AgentContext::checkpoint()`. Zincir persists the candidate before invoking the application-provided verifier closure and stores its accepted or rejected decision with evidence.
+
+The optional reference runner advertises a built-in `submit_checkpoint` tool and uses a configured command as its verifier. A zero exit status accepts the candidate; any other exit status rejects it and returns the verifier output to the agent for replanning.
 
 The verifier receives the proposed state in `ZINCIR_CHECKPOINT_JSON`. It is configured as a program and argument vector, without shell interpolation:
 
@@ -248,23 +272,24 @@ It does not currently guarantee:
 - That an in-progress provider call will not be repeated after a crash.
 - Deterministic re-generation by an LLM.
 - Distributed ownership of the same run across machines.
-- Continuous lease heartbeats during provider or tool calls longer than five minutes.
+- Continuous lease heartbeats during provider or tool calls longer than the configured lease TTL (five minutes in the reference runner).
 
 ## Roadmap
 
-1. Add an automatic resume worker and continuous lease heartbeats.
-2. Add one real coding-agent integration with observable round and tool boundaries.
-3. Bind coding checkpoints to a generated workspace revision instead of agent-supplied artifact labels.
+1. Stabilize `AgentContext` and add provider-agnostic custom-agent examples.
+2. Bind coding checkpoints to a generated workspace revision instead of agent-supplied artifact labels.
+3. Add an automatic resume worker and continuous lease heartbeats.
 4. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
 5. Add durable signals and human approval waits.
 6. Add child runs and durable spawn/join after the single-agent path is proven.
 7. Add Postgres only when multi-machine execution is required.
 
-The target demonstration is a test-backed repository task that survives an injected process kill, restores verified progress, continues in a fresh context, and completes without duplicating external effects. The accompanying benchmark will vary three dimensions independently: crash durability, context strategy, and verification policy.
+The target demonstration is a small custom agent that survives an injected process kill, restores verified progress, continues in a fresh context, and completes without duplicating external effects. The accompanying benchmark will vary three dimensions independently: crash durability, context strategy, and verification policy.
 
 ## Non-goals for v1
 
-- Being the planner or intelligence of the long-horizon agent.
+- Being the planner, model client, tool framework, or intelligence of the long-horizon agent.
+- Wrapping end-user agent CLIs as the primary product.
 - Hosted service or visual workflow builder.
 - General distributed cluster in the SQLite backend.
 - Generic multi-agent orchestration before the single-agent recovery path is proven.

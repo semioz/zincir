@@ -155,7 +155,7 @@ pub async fn renew_run_lease(
     let rows = sqlx::query(
         "UPDATE agent_runs SET lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
-           AND lease_expires_at_ms > ?",
+           AND status IN ('pending', 'running') AND lease_expires_at_ms > ?",
     )
     .bind(expires_at_ms)
     .bind(lease.run_id)
@@ -237,7 +237,7 @@ async fn update_run_status(pool: &SqlitePool, id: Uuid, status: RunStatus) -> Re
     finish_transaction(&mut connection, result).await
 }
 
-pub async fn update_run_status_with_lease(
+pub(crate) async fn update_run_status_with_lease(
     pool: &SqlitePool,
     lease: &RunLease,
     status: RunStatus,
@@ -287,7 +287,34 @@ pub async fn propose_checkpoint_with_lease(
     begin_immediate(&mut connection).await?;
 
     let result = async {
-        validate_run_lease(&mut connection, lease).await?;
+        validate_writable_run_lease(&mut connection, lease).await?;
+        let has_pending_intent: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM events intent
+                 WHERE intent.run_id = ?
+                   AND intent.event_type = 'tool_call'
+                   AND json_extract(intent.payload, '$.call_id') = ?
+                   AND json_extract(intent.payload, '$.name') = 'submit_checkpoint'
+                   AND COALESCE(json_extract(intent.payload, '$.response_tool_count'), 1) = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM events result
+                       WHERE result.run_id = intent.run_id
+                         AND result.event_type = 'tool_result'
+                         AND result.seq > intent.seq
+                         AND json_extract(result.payload, '$.call_id') = json_extract(intent.payload, '$.call_id')
+                   )
+             )",
+        )
+        .bind(lease.run_id)
+        .bind(tool_call_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if !has_pending_intent {
+            return Err(Error::InvalidState(format!(
+                "checkpoint tool call {tool_call_id:?} is not a pending standalone intent"
+            )));
+        }
+
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM checkpoints WHERE run_id = ? AND status = 'candidate'
@@ -352,7 +379,7 @@ pub async fn decide_checkpoint_with_lease(
     begin_immediate(&mut connection).await?;
 
     let result = async {
-        validate_run_lease(&mut connection, lease).await?;
+        validate_writable_run_lease(&mut connection, lease).await?;
         let candidate = sqlx::query_as::<_, CheckpointRecord>(
             "SELECT * FROM checkpoints
              WHERE id = ? AND run_id = ? AND status = 'candidate'",
@@ -414,6 +441,55 @@ pub async fn decide_checkpoint_with_lease(
     finish_transaction(&mut connection, result).await
 }
 
+pub async fn get_checkpoint_candidate_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    checkpoint_id: i64,
+) -> Result<CheckpointRecord> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+    let result = async {
+        validate_writable_run_lease(&mut connection, lease).await?;
+        sqlx::query_as::<_, CheckpointRecord>(
+            "SELECT * FROM checkpoints
+             WHERE id = ? AND run_id = ? AND status = 'candidate'",
+        )
+        .bind(checkpoint_id)
+        .bind(lease.run_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidState(format!(
+                "checkpoint {checkpoint_id} is not an active candidate"
+            ))
+        })
+    }
+    .await;
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn get_pending_checkpoint_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+) -> Result<Option<CheckpointRecord>> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+    let result = async {
+        validate_writable_run_lease(&mut connection, lease).await?;
+        sqlx::query_as::<_, CheckpointRecord>(
+            "SELECT * FROM checkpoints
+             WHERE run_id = ? AND status = 'candidate'
+             ORDER BY round DESC LIMIT 1",
+        )
+        .bind(lease.run_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(Into::into)
+    }
+    .await;
+    finish_transaction(&mut connection, result).await
+}
+
 pub async fn get_pending_checkpoint(
     pool: &SqlitePool,
     run_id: Uuid,
@@ -442,6 +518,36 @@ pub async fn get_latest_accepted_checkpoint(
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
+}
+
+pub async fn complete_run_with_lease(pool: &SqlitePool, lease: &RunLease) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+    let result = async {
+        validate_writable_run_lease(&mut connection, lease).await?;
+        let seq = next_event_seq(&mut connection, lease.run_id).await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            seq,
+            EventType::StateTransition,
+            &json!({ "from": RunStatus::Running, "to": RunStatus::Completed }),
+            None,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE agent_runs
+             SET status = 'completed', lease_owner = NULL, lease_expires_at_ms = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?",
+        )
+        .bind(lease.run_id)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+    .await;
+    finish_transaction(&mut connection, result).await
 }
 
 pub async fn list_inflight_runs(pool: &SqlitePool) -> Result<Vec<AgentRun>> {
@@ -494,7 +600,7 @@ pub async fn append_llm_call_with_tool_intents_with_lease(
     begin_immediate(&mut connection).await?;
 
     let result = async {
-        validate_run_lease(&mut connection, lease).await?;
+        validate_writable_run_lease(&mut connection, lease).await?;
         let mut seq = next_event_seq(&mut connection, lease.run_id).await?;
         insert_event(
             &mut connection,
@@ -505,19 +611,84 @@ pub async fn append_llm_call_with_tool_intents_with_lease(
             None,
         )
         .await?;
-        for (payload, idempotency_key) in tool_intents {
+        for (payload, call_id) in tool_intents {
             seq += 1;
+            let idempotency_key = format!("tool_call:{call_id}");
             insert_event(
                 &mut connection,
                 lease.run_id,
                 seq,
                 EventType::ToolCall,
                 payload,
-                Some(idempotency_key),
+                Some(&idempotency_key),
             )
             .await?;
         }
         Ok(())
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
+pub async fn record_tool_result_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    call_id: &str,
+    content: &Value,
+) -> Result<Event> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        validate_writable_run_lease(&mut connection, lease).await?;
+        let intent: Option<(i32, String)> = sqlx::query_as(
+            "SELECT seq, json_extract(payload, '$.name') FROM events
+             WHERE run_id = ? AND event_type = 'tool_call'
+               AND json_extract(payload, '$.call_id') = ?",
+        )
+        .bind(lease.run_id)
+        .bind(call_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let (intent_seq, tool_name) = intent.ok_or_else(|| {
+            Error::InvalidState(format!("tool call {call_id:?} has no durable intent"))
+        })?;
+        if tool_name == "submit_checkpoint" {
+            return Err(Error::InvalidState(
+                "checkpoint results must be produced by checkpoint verification".into(),
+            ));
+        }
+        let payload = json!({ "call_id": call_id, "content": content });
+        let existing = sqlx::query_as::<_, Event>(
+            "SELECT * FROM events
+             WHERE run_id = ? AND event_type = 'tool_result'
+               AND json_extract(payload, '$.call_id') = ?
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(lease.run_id)
+        .bind(call_id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        if let Some(existing) = existing {
+            if existing.seq <= intent_seq || existing.payload != payload {
+                return Err(Error::InvalidState(format!(
+                    "tool call {call_id:?} already has a conflicting result"
+                )));
+            }
+            return Ok(existing);
+        }
+
+        let seq = next_event_seq(&mut connection, lease.run_id).await?;
+        insert_event(
+            &mut connection,
+            lease.run_id,
+            seq,
+            EventType::ToolResult,
+            &payload,
+            Some(&format!("tool_result:{call_id}")),
+        )
+        .await
     }
     .await;
 
@@ -535,7 +706,7 @@ pub async fn append_event_with_lease(
     begin_immediate(&mut connection).await?;
 
     let result = async {
-        validate_run_lease(&mut connection, lease).await?;
+        validate_writable_run_lease(&mut connection, lease).await?;
         let seq = next_event_seq(&mut connection, lease.run_id).await?;
         insert_event(
             &mut connection,
@@ -550,6 +721,20 @@ pub async fn append_event_with_lease(
     .await;
 
     finish_transaction(&mut connection, result).await
+}
+
+async fn validate_writable_run_lease(
+    connection: &mut SqliteConnection,
+    lease: &RunLease,
+) -> Result<()> {
+    validate_run_lease(connection, lease).await?;
+    if current_status(connection, lease.run_id).await? != RunStatus::Running {
+        return Err(Error::InvalidState(format!(
+            "run {} is not writable",
+            lease.run_id
+        )));
+    }
+    Ok(())
 }
 
 async fn validate_run_lease(connection: &mut SqliteConnection, lease: &RunLease) -> Result<()> {
@@ -820,6 +1005,36 @@ pub async fn get_events(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<Event>> {
         .map_err(Into::into)
 }
 
+pub async fn find_pending_tool_calls_with_lease(
+    pool: &SqlitePool,
+    lease: &RunLease,
+) -> Result<Vec<Event>> {
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+    let result = async {
+        validate_writable_run_lease(&mut connection, lease).await?;
+        sqlx::query_as::<_, Event>(
+            "SELECT e.* FROM events e
+             WHERE e.run_id = ?
+               AND e.event_type = 'tool_call'
+               AND NOT EXISTS (
+                 SELECT 1 FROM events e2
+                 WHERE e2.run_id = e.run_id
+                   AND e2.event_type = 'tool_result'
+                   AND e2.seq > e.seq
+                   AND json_extract(e2.payload, '$.call_id') = json_extract(e.payload, '$.call_id')
+               )
+             ORDER BY e.seq",
+        )
+        .bind(lease.run_id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(Into::into)
+    }
+    .await;
+    finish_transaction(&mut connection, result).await
+}
+
 /// tool_call events with no matching tool_result — the crash window.
 pub async fn find_pending_tool_calls(pool: &SqlitePool, run_id: Uuid) -> Result<Vec<Event>> {
     sqlx::query_as::<_, Event>(
@@ -830,7 +1045,8 @@ pub async fn find_pending_tool_calls(pool: &SqlitePool, run_id: Uuid) -> Result<
              SELECT 1 FROM events e2
              WHERE e2.run_id = e.run_id
                AND e2.event_type = 'tool_result'
-               AND json_extract(e2.payload, '$.call_id') = e.idempotency_key
+               AND e2.seq > e.seq
+               AND json_extract(e2.payload, '$.call_id') = json_extract(e.payload, '$.call_id')
            )
          ORDER BY e.seq",
     )
@@ -897,6 +1113,9 @@ mod tests {
         let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
             .await
             .unwrap();
+        update_run_status_with_lease(&pool, &lease, RunStatus::Running)
+            .await
+            .unwrap();
         let intents = vec![
             (
                 json!({ "call_id": "call_1", "name": "one", "args": {} }),
@@ -918,12 +1137,18 @@ mod tests {
         .unwrap();
 
         let events = get_events(&pool, run.id).await.unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].event_type, EventType::LlmCall);
-        assert_eq!(events[1].event_type, EventType::ToolCall);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[1].event_type, EventType::LlmCall);
         assert_eq!(events[2].event_type, EventType::ToolCall);
-        assert_eq!(events[1].idempotency_key.as_deref(), Some("call_1"));
-        assert_eq!(events[2].idempotency_key.as_deref(), Some("call_2"));
+        assert_eq!(events[3].event_type, EventType::ToolCall);
+        assert_eq!(
+            events[2].idempotency_key.as_deref(),
+            Some("tool_call:call_1")
+        );
+        assert_eq!(
+            events[3].idempotency_key.as_deref(),
+            Some("tool_call:call_2")
+        );
         pool.close().await;
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -935,12 +1160,22 @@ mod tests {
         let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
             .await
             .unwrap();
-        append_event_with_lease(
+        update_run_status_with_lease(&pool, &lease, RunStatus::Running)
+            .await
+            .unwrap();
+        append_llm_call_with_tool_intents_with_lease(
             &pool,
             &lease,
-            EventType::LlmCall,
-            &json!({ "content": "checkpoint" }),
-            None,
+            &json!({ "content": "checkpoint", "tool_calls": [], "stop_reason": "tool_use" }),
+            &[(
+                json!({
+                    "call_id": "checkpoint_1",
+                    "name": "submit_checkpoint",
+                    "args": {},
+                    "response_tool_count": 1
+                }),
+                "checkpoint_1".into(),
+            )],
         )
         .await
         .unwrap();
@@ -973,11 +1208,100 @@ mod tests {
         assert_eq!(accepted.status, "accepted");
         assert_eq!(latest.id, accepted.id);
         assert_eq!(latest.state, serde_json::to_value(state).unwrap());
-        assert_eq!(latest.based_on_event_seq, 0);
-        assert_eq!(latest.decision_event_seq, Some(2));
-        assert_eq!(events[1].event_type, EventType::CheckpointProposed);
-        assert_eq!(events[2].event_type, EventType::CheckpointAccepted);
-        assert_eq!(events[3].event_type, EventType::ToolResult);
+        assert_eq!(latest.based_on_event_seq, 2);
+        assert_eq!(latest.decision_event_seq, Some(4));
+        assert_eq!(events[3].event_type, EventType::CheckpointProposed);
+        assert_eq!(events[4].event_type, EventType::CheckpointAccepted);
+        assert_eq!(events[5].event_type, EventType::ToolResult);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_checkpoint_intent_cannot_be_proposed() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        update_run_status_with_lease(&pool, &lease, RunStatus::Running)
+            .await
+            .unwrap();
+        append_llm_call_with_tool_intents_with_lease(
+            &pool,
+            &lease,
+            &json!({ "content": "invalid checkpoint", "tool_calls": [], "stop_reason": "tool_use" }),
+            &[(
+                json!({
+                    "call_id": "checkpoint_1",
+                    "name": "submit_checkpoint",
+                    "args": {},
+                    "response_tool_count": 1
+                }),
+                "checkpoint_1".into(),
+            )],
+        )
+        .await
+        .unwrap();
+        append_event_with_lease(
+            &pool,
+            &lease,
+            EventType::ToolResult,
+            &json!({ "call_id": "checkpoint_1", "content": { "accepted": false } }),
+            Some("checkpoint_error:checkpoint_1"),
+        )
+        .await
+        .unwrap();
+
+        let result = propose_checkpoint_with_lease(
+            &pool,
+            &lease,
+            "checkpoint_1",
+            &CheckpointState {
+                completed: vec![],
+                remaining: vec!["work".into()],
+                artifacts: vec![],
+                failed_attempts: vec![],
+                evidence: vec![],
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_records_terminal_state_and_releases_lease_atomically() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        update_run_status_with_lease(&pool, &lease, RunStatus::Running)
+            .await
+            .unwrap();
+
+        complete_run_with_lease(&pool, &lease).await.unwrap();
+
+        let row: (RunStatus, Option<Uuid>, Option<i64>) = sqlx::query_as(
+            "SELECT status, lease_owner, lease_expires_at_ms FROM agent_runs WHERE id = ?",
+        )
+        .bind(run.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (RunStatus::Completed, None, None));
+        let stale_write = append_event_with_lease(
+            &pool,
+            &lease,
+            EventType::LlmCall,
+            &json!({ "late": true }),
+            None,
+        )
+        .await;
+        assert!(matches!(stale_write, Err(Error::InvalidState(_))));
         pool.close().await;
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1072,6 +1396,9 @@ mod tests {
         let first = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
             .await
             .unwrap();
+        update_run_status_with_lease(&pool, &first, RunStatus::Running)
+            .await
+            .unwrap();
         sqlx::query("UPDATE agent_runs SET lease_expires_at_ms = 0 WHERE id = ?")
             .bind(run.id)
             .execute(&pool)
@@ -1102,7 +1429,7 @@ mod tests {
 
         assert_eq!(second.epoch, first.epoch + 1);
         assert!(matches!(stale, Error::InvalidState(_)));
-        assert_eq!(get_events(&pool, run.id).await.unwrap().len(), 1);
+        assert_eq!(get_events(&pool, run.id).await.unwrap().len(), 2);
         pool.close().await;
         std::fs::remove_dir_all(directory).unwrap();
     }

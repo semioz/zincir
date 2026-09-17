@@ -104,13 +104,20 @@ impl Runtime {
             db::acquire_run_lease(&self.pool, run_id, owner_id, RUN_LEASE_TTL).await?
         };
         let result = self.run_with_lease(run, lease).await;
-        if let Err(error) = db::release_run_lease(&self.pool, &lease).await {
-            if result.is_ok() {
-                return Err(error);
-            }
-            tracing::warn!(run_id = %run_id, %error, "failed to release run lease");
+        let Err(release_error) = db::release_run_lease(&self.pool, &lease).await else {
+            return result;
+        };
+        if db::get_run(&self.pool, run_id)
+            .await
+            .is_ok_and(|run| run.status == RunStatus::Completed)
+        {
+            return result;
         }
-        result
+        if result.is_err() {
+            tracing::warn!(run_id = %run_id, error = %release_error, "failed to release run lease");
+            return result;
+        }
+        Err(release_error)
     }
 
     async fn run_with_lease(&self, run: crate::types::AgentRun, mut lease: RunLease) -> Result<()> {
@@ -131,7 +138,7 @@ impl Runtime {
                     let content = invalid_checkpoint_result(
                         "submit_checkpoint must be the only tool call in a response",
                     );
-                    append_tool_result(&self.pool, &lease, &call.id, &content).await?;
+                    append_checkpoint_error(&self.pool, &lease, &call.id, &content).await?;
                     continue;
                 }
                 match serde_json::from_value(call.args.clone()) {
@@ -141,7 +148,7 @@ impl Runtime {
                     }
                     Err(error) => {
                         let content = invalid_checkpoint_result(&error.to_string());
-                        append_tool_result(&self.pool, &lease, &call.id, &content).await?;
+                        append_checkpoint_error(&self.pool, &lease, &call.id, &content).await?;
                     }
                 }
             }
@@ -150,7 +157,7 @@ impl Runtime {
         let accepted = db::get_latest_accepted_checkpoint(&self.pool, run_id).await?;
         if let Some(checkpoint) = accepted.as_ref() {
             if checkpoint_completes_run(checkpoint)? {
-                db::update_run_status_with_lease(&self.pool, &lease, RunStatus::Completed).await?;
+                db::complete_run_with_lease(&self.pool, &lease).await?;
                 return Ok(());
             }
         }
@@ -222,7 +229,7 @@ impl Runtime {
                         let content = invalid_checkpoint_result(
                             "submit_checkpoint must be the only tool call in a response",
                         );
-                        append_tool_result(&self.pool, &lease, &call.id, &content).await?;
+                        append_checkpoint_error(&self.pool, &lease, &call.id, &content).await?;
                         messages.push(LlmMessage::tool(&call.id, &content));
                         continue;
                     }
@@ -230,7 +237,7 @@ impl Runtime {
                         Ok(state) => state,
                         Err(error) => {
                             let content = invalid_checkpoint_result(&error.to_string());
-                            append_tool_result(&self.pool, &lease, &call.id, &content).await?;
+                            append_checkpoint_error(&self.pool, &lease, &call.id, &content).await?;
                             messages.push(LlmMessage::tool(&call.id, &content));
                             continue;
                         }
@@ -240,12 +247,7 @@ impl Runtime {
                         .await?;
                     if checkpoint.status == "accepted" {
                         if state.remaining.is_empty() {
-                            db::update_run_status_with_lease(
-                                &self.pool,
-                                &lease,
-                                RunStatus::Completed,
-                            )
-                            .await?;
+                            db::complete_run_with_lease(&self.pool, &lease).await?;
                             info!(run_id = %run_id, "run completed from verified checkpoint");
                             break 'rounds;
                         }
@@ -324,11 +326,28 @@ async fn append_tool_result(
     call_id: &str,
     content: &Value,
 ) -> Result<()> {
+    db::record_tool_result_with_lease(pool, lease, call_id, content).await?;
+    Ok(())
+}
+
+async fn append_checkpoint_error(
+    pool: &SqlitePool,
+    lease: &RunLease,
+    call_id: &str,
+    content: &Value,
+) -> Result<()> {
     let payload = serde_json::to_value(ToolResultPayload {
         call_id: call_id.into(),
         content: content.clone(),
     })?;
-    db::append_event_with_lease(pool, lease, EventType::ToolResult, &payload, None).await?;
+    db::append_event_with_lease(
+        pool,
+        lease,
+        EventType::ToolResult,
+        &payload,
+        Some(&format!("checkpoint_error:{call_id}")),
+    )
+    .await?;
     Ok(())
 }
 
@@ -763,6 +782,9 @@ mod tests {
         let lease = db::acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
             .await
             .unwrap();
+        db::update_run_status_with_lease(&pool, &lease, RunStatus::Running)
+            .await
+            .unwrap();
         let checkpoint = ToolCall {
             id: "mixed_checkpoint".into(),
             name: "submit_checkpoint".into(),
@@ -863,6 +885,9 @@ mod tests {
         .await
         .unwrap();
         let lease = db::acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        db::update_run_status_with_lease(&pool, &lease, RunStatus::Running)
             .await
             .unwrap();
         let call = ToolCall {
