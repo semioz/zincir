@@ -68,7 +68,7 @@ async fn validate_schema(pool: &SqlitePool) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidState(
-            "database schema is incomplete; run `cargo run` to apply migrations".into(),
+            "database schema is incomplete; migrate it from your application or run `cargo run --example durable_agent`".into(),
         ))
     }
 }

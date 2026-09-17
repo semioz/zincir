@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Verifies SQLite-backed crash recovery before and after an idempotent effect.
+# Verifies SQLite-backed crash recovery around tool effects and checkpoint acceptance.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 export RUST_LOG="info"
-BIN="$ROOT_DIR/target/debug/zincir"
+BIN="$ROOT_DIR/target/debug/examples/durable_agent"
 TMP_ROOT="$(mktemp -d -t zincir-crash.XXXXXX)"
 CHILD_PID=""
 START_LOG=""
@@ -74,6 +74,11 @@ wait_for_crash_point() {
                 printf '%s' "$run_id"
                 return
             fi
+            if [[ "$crash_point" == "after-checkpoint" ]] &&
+                [[ "$(sql "SELECT count(*) FROM checkpoints WHERE lower(hex(run_id)) = '$run_id' AND status = 'accepted';")" == "1" ]]; then
+                printf '%s' "$run_id"
+                return
+            fi
         fi
 
         if ! kill -0 "$CHILD_PID" 2>/dev/null; then
@@ -92,11 +97,12 @@ assert_run_completed_once() {
     local effect_file="$2"
     local expected_inode="${3:-}"
 
-    local status tool_calls tool_results accepted_checkpoints event_types effect_count
+    local status tool_calls tool_results accepted_checkpoints checkpoint_artifact event_types effect_count
     status="$(sql "SELECT status FROM agent_runs WHERE lower(hex(id)) = '$run_id';")"
     tool_calls="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_call';")"
     tool_results="$(sql "SELECT count(*) FROM events WHERE lower(hex(run_id)) = '$run_id' AND event_type = 'tool_result';")"
     accepted_checkpoints="$(sql "SELECT count(*) FROM checkpoints WHERE lower(hex(run_id)) = '$run_id' AND status = 'accepted';")"
+    checkpoint_artifact="$(sql "SELECT json_extract(state, '$.artifacts[0]') FROM checkpoints WHERE lower(hex(run_id)) = '$run_id' AND status = 'accepted';")"
     event_types="$(sql "
         SELECT group_concat(event_type, ',')
         FROM (
@@ -111,6 +117,8 @@ assert_run_completed_once() {
     [[ "$tool_calls" == "2" ]] || fail "expected 2 tool_calls, got $tool_calls"
     [[ "$tool_results" == "2" ]] || fail "expected 2 tool_results, got $tool_results"
     [[ "$accepted_checkpoints" == "1" ]] || fail "expected 1 accepted checkpoint, got $accepted_checkpoints"
+    [[ "$checkpoint_artifact" == "$effect_file" ]] ||
+        fail "checkpoint artifact does not match effect file: $checkpoint_artifact"
     [[ "$event_types" == "state_transition,llm_call,tool_call,tool_result,llm_call,tool_call,checkpoint_proposed,checkpoint_accepted,tool_result,state_transition" ]] ||
         fail "unexpected event order: $event_types"
     [[ "$effect_count" == "1" ]] || fail "expected one effect file, got $effect_count"
@@ -133,12 +141,14 @@ run_case() {
     DATABASE_PATH="$case_dir/zincir.db"
     export ZINCIR_DATABASE_PATH="$DATABASE_PATH"
     export ZINCIR_OUTPUT_DIR="$case_dir"
-    unset ZINCIR_RESUME ZINCIR_PAUSE_BEFORE_TOOL_MS ZINCIR_PAUSE_AFTER_TOOL_MS
+    unset ZINCIR_RESUME ZINCIR_PAUSE_BEFORE_TOOL_MS ZINCIR_PAUSE_AFTER_TOOL_MS ZINCIR_PAUSE_AFTER_CHECKPOINT_MS
 
     if [[ "$crash_point" == "before-effect" ]]; then
         export ZINCIR_PAUSE_BEFORE_TOOL_MS=60000
-    else
+    elif [[ "$crash_point" == "after-effect" ]]; then
         export ZINCIR_PAUSE_AFTER_TOOL_MS=60000
+    else
+        export ZINCIR_PAUSE_AFTER_CHECKPOINT_MS=60000
     fi
 
     echo "== starting $crash_point case =="
@@ -161,7 +171,7 @@ run_case() {
         effect_inode="$(file_inode "$effect_file")"
     fi
 
-    unset ZINCIR_PAUSE_BEFORE_TOOL_MS ZINCIR_PAUSE_AFTER_TOOL_MS
+    unset ZINCIR_PAUSE_BEFORE_TOOL_MS ZINCIR_PAUSE_AFTER_TOOL_MS ZINCIR_PAUSE_AFTER_CHECKPOINT_MS
     echo "== resuming $crash_point case =="
     if ! ZINCIR_RESUME=1 "$BIN" >"$RESUME_LOG" 2>&1; then
         fail "resume process failed"
@@ -179,9 +189,10 @@ run_case() {
 }
 
 echo "== building zincir =="
-cargo build --quiet
+cargo build --quiet --example durable_agent
 
 run_case before-effect
 run_case after-effect
+run_case after-checkpoint
 
-echo "PASS: all SQLite crash boundaries recovered"
+echo "PASS: all tested SQLite crash boundaries recovered"

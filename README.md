@@ -45,24 +45,24 @@ A checkpoint must not become trusted merely because the executor produced it. Ac
 Current foundation:
 
 - `AgentContext` lets custom agent loops record responses, recover tools, verify checkpoints, and reconstruct durable state.
-- The crate also includes a small reference runner with a stub model and tool.
-- LLM responses and tool intent/results are recorded in a per-run event log.
-- Inflight runs can reconstruct their conversation and resume.
-- Expiring run leases and fencing tokens prevent concurrent runtimes from persisting work for the same run.
-- Agents submit semantic checkpoint candidates that a configured command verifies independently.
-- Accepted checkpoints start fresh contexts from the original goal and verified progress.
-- Deterministic tests verify process-kill recovery both before and after the demo tool's atomic side effect.
-- Multi-agent coordination, real providers, harness integrations, and sandboxing are not implemented.
+- The crate also includes `examples/durable_agent.rs`, a small custom loop with an idempotent demo tool.
+- Model responses and tool intent/results are recorded in a per-run event log.
+- Inflight runs expose their durable state for application-controlled recovery.
+- Expiring run leases and fencing tokens prevent concurrent contexts from persisting work for the same run.
+- Applications submit semantic checkpoint candidates and verify them with async Rust closures.
+- Accepted checkpoints let applications construct fresh contexts from verified progress.
+- Deterministic tests verify process-kill recovery before and after the demo tool's atomic side effect and after checkpoint acceptance.
+- Multi-agent coordination, an automatic resume worker, and sandboxing are not implemented; model and tool integrations belong to the application.
 
 ## Current capabilities
 
 ### Durable run state
 
-Each agent has an `agent_runs` row containing its status, provider label, and JSON configuration. The configuration includes the initial system prompt and input needed to reconstruct the conversation.
+Each agent has an `agent_runs` row containing its status, provider label, and application-defined JSON configuration.
 
 ### Event replay
 
-The runtime treats `events` as an append-only, sequence-ordered log:
+Zincir treats `events` as an append-only, sequence-ordered log:
 
 - `llm_call` records a completed provider response.
 - `tool_call` records tool intent before execution.
@@ -70,7 +70,7 @@ The runtime treats `events` as an append-only, sequence-ordered log:
 - `state_transition` records status changes such as `pending → running` and `running → completed`.
 - `checkpoint_proposed`, `checkpoint_accepted`, and `checkpoint_rejected` record checkpoint lineage and verifier decisions.
 
-On resume, Zincir resolves unfinished checkpoint candidates and rebuilds messages from the latest accepted checkpoint plus subsequent events.
+On resume, `AgentContext::state()` returns the latest accepted checkpoint plus subsequent events so the application can construct its next model context.
 
 ### Transactional event ordering
 
@@ -103,41 +103,15 @@ ctx.record_response(response.content, &response.tool_calls, "tool_use").await?;
 
 Checkpoint verification is supplied by application code as an async closure. If it is interrupted after the candidate is persisted, `AgentContext::recover()` and `pending_checkpoint()` expose it for another verification attempt.
 
-### Reference runner
+### Reference example
 
-The bundled demo runner is optional example code built around two traits:
-
-```rust
-#[async_trait]
-pub trait LLMProvider: Send + Sync {
-    async fn complete(
-        &self,
-        messages: Vec<LlmMessage>,
-        tools: Vec<ToolSchema>,
-    ) -> Result<Response>;
-}
-
-#[async_trait]
-pub trait ToolExecutor: Send + Sync {
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult>;
-}
-```
-
-The demo binary wires `StubProvider` and `IdempotentFileExecutor` directly. The executor stores one atomic result file per tool-call ID and reuses it on retry. Applications using `AgentContext` do not need to implement either trait; they can use their existing model and tool code.
+`examples/durable_agent.rs` is a complete custom loop built directly on `AgentContext`. It records a synthetic model response, executes an idempotent file tool, submits a semantic checkpoint, verifies the artifact with an async Rust closure, and demonstrates recovery around the tool effect and checkpoint acceptance. It is example code, not a model or tool abstraction required by the SDK.
 
 ### Verified semantic checkpoints
 
 A custom loop submits completed work, remaining work, artifacts, failed attempts, and evidence through `AgentContext::checkpoint()`. Zincir persists the candidate before invoking the application-provided verifier closure and stores its accepted or rejected decision with evidence.
 
-The optional reference runner advertises a built-in `submit_checkpoint` tool and uses a configured command as its verifier. A zero exit status accepts the candidate; any other exit status rejects it and returns the verifier output to the agent for replanning.
-
-The verifier receives the proposed state in `ZINCIR_CHECKPOINT_JSON`. It is configured as a program and argument vector, without shell interpolation:
-
-```rust
-verification_command: vec!["cargo".into(), "test".into()],
-```
-
-An accepted checkpoint with remaining work starts a fresh model context containing the original goal and checkpoint state. An accepted checkpoint with no remaining work completes the run. A candidate left unfinished by a crash is verified during explicit resume.
+A verifier returns `Verification { passed, evidence }`. The application decides whether accepted remaining work starts a fresh model context and whether an accepted checkpoint with no remaining work completes the run. A candidate left unfinished by a crash is exposed through `pending_checkpoint()` for another verification attempt.
 
 ### Durable named steps
 
@@ -170,15 +144,12 @@ The schema includes parent/child run relationships and a durable `messages` tabl
 ## Architecture
 
 ```text
-RunConfig + agent_runs
-        │
-        ▼
-     Runtime
-        │
-        ├── LLMProvider
-        ├── ToolExecutor
-        ├── command verifier
-        └── SQLite events + checkpoints
+Your model + tools + agent loop
+              │
+              ▼
+         AgentContext
+              │
+              └── SQLite runs + events + checkpoints
 ```
 
 SQLite contains six tables:
@@ -197,34 +168,35 @@ See `migrations/` for the complete schema.
 Requirements: Linux or macOS and Rust. No database server is required.
 
 ```bash
-RUST_LOG=info cargo run
+RUST_LOG=info cargo run --example durable_agent
 ```
 
 This creates `zincir.db` in the current directory. Use `ZINCIR_DATABASE_PATH` to place it elsewhere:
 
 ```bash
-ZINCIR_DATABASE_PATH=~/.local/share/zincir/zincir.db RUST_LOG=info cargo run
+ZINCIR_DATABASE_PATH=~/.local/share/zincir/zincir.db RUST_LOG=info \
+  cargo run --example durable_agent
 ```
 
 The demo:
 
-1. Creates one run with valid durable configuration.
-2. Calls the stub provider, which requests a `write_file` tool.
-3. Records the tool intent.
+1. Creates one run with application-defined configuration.
+2. The example loop records a synthetic response requesting `write_file`.
+3. Records the tool intent atomically with that response.
 4. Atomically publishes `output/call_1.json`.
 5. Records the tool result.
-6. Calls the stub provider again, which submits a checkpoint candidate.
-7. Runs the configured verifier and accepts the checkpoint.
+6. The loop records a synthetic checkpoint request.
+7. Runs its verifier closure and accepts the checkpoint.
 8. Completes the run because the verified checkpoint has no remaining work.
 9. Prints that run and its event log.
 
 To resume existing `pending` or `running` runs instead of creating a new one:
 
 ```bash
-ZINCIR_RESUME=1 RUST_LOG=info cargo run
+ZINCIR_RESUME=1 RUST_LOG=info cargo run --example durable_agent
 ```
 
-Explicit resume fences the previous lease owner, so use it only after confirming that the previous process is dead. `ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS` and `ZINCIR_PAUSE_AFTER_TOOL_MS` expose both crash boundaries for testing.
+Explicit resume fences the previous lease owner, so use it only after confirming that the previous process is dead. `ZINCIR_OUTPUT_DIR` overrides the demo output directory. `ZINCIR_PAUSE_BEFORE_TOOL_MS`, `ZINCIR_PAUSE_AFTER_TOOL_MS`, and `ZINCIR_PAUSE_AFTER_CHECKPOINT_MS` expose the tested crash boundaries.
 
 ## Inspector UI
 
@@ -246,7 +218,7 @@ The Inspector deliberately has no Resume, Recover, or Cancel controls yet. Those
 ./tests/crash_kill_resume.sh
 ```
 
-The acceptance script requires the `sqlite3` CLI (preinstalled on macOS; install your distribution's SQLite package on Linux). It creates temporary SQLite databases, kills the exact binary before the side effect, then repeats after the atomic side effect but before `tool_result` persistence. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
+The acceptance script requires the `sqlite3` CLI (preinstalled on macOS; install your distribution's SQLite package on Linux). It creates temporary SQLite databases and kills the exact binary before the tool side effect, after the atomic side effect but before `tool_result` persistence, and after checkpoint acceptance but before run completion. Each scenario resumes the exact run, checks event order and status, verifies one observable effect, and confirms a second resume is a no-op.
 
 SQLite concurrency tests run with the normal Rust suite:
 
@@ -272,7 +244,7 @@ It does not currently guarantee:
 - That an in-progress provider call will not be repeated after a crash.
 - Deterministic re-generation by an LLM.
 - Distributed ownership of the same run across machines.
-- Continuous lease heartbeats during provider or tool calls longer than the configured lease TTL (five minutes in the reference runner).
+- Continuous lease heartbeats during provider or tool calls longer than the configured lease TTL (five minutes in the reference example).
 
 ## Roadmap
 

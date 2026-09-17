@@ -201,38 +201,9 @@ pub struct TimerRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-// ---------------------------------------------------------------------------
-// Tool primitives — shared by provider and tool modules
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub args: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub call_id: String,
-    pub content: Value,
-}
-
-// ---------------------------------------------------------------------------
-// Per-run config — stored as JSON text in agent_runs.config, drives replay.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunConfig {
-    pub model: String,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    pub system: String,
-    pub input: String,
-    #[serde(default)]
-    pub tools: Vec<String>,
-    #[serde(default)]
-    pub verification_command: Vec<String>,
 }
