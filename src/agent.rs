@@ -1,13 +1,21 @@
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use tokio::{
+    sync::{oneshot, Mutex, OwnedMutexGuard},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use crate::{
     db,
-    error::Result,
+    error::{Error, Result},
     types::{AgentRun, CheckpointRecord, CheckpointState, Event, RunLease, RunStatus, ToolCall},
 };
 
@@ -30,11 +38,93 @@ pub struct PendingToolCall {
     pub response_tool_count: usize,
 }
 
+const MIN_LEASE_TTL: Duration = Duration::from_millis(30);
+
 pub struct AgentContext {
     pool: SqlitePool,
     run_id: Uuid,
     lease: RunLease,
     lease_ttl: Duration,
+    heartbeat: LeaseHeartbeat,
+}
+
+struct LeaseHeartbeat {
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+    failure: Arc<StdMutex<Option<String>>>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl LeaseHeartbeat {
+    fn start(pool: SqlitePool, lease: RunLease, ttl: Duration) -> Self {
+        let interval = ttl
+            .checked_div(3)
+            .filter(|interval| !interval.is_zero())
+            .unwrap_or(Duration::from_millis(1));
+        let (stop, mut stopped) = oneshot::channel();
+        let failure = Arc::new(StdMutex::new(None));
+        let gate = Arc::new(Mutex::new(()));
+        let task_failure = Arc::clone(&failure);
+        let task_gate = Arc::clone(&gate);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        let _guard = task_gate.lock().await;
+                        if let Err(error) = db::renew_run_lease(&pool, &lease, ttl).await {
+                            *task_failure.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(error.to_string());
+                            break;
+                        }
+                    }
+                    _ = &mut stopped => break,
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            task: Some(task),
+            failure,
+            gate,
+        }
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(message) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Err(Error::InvalidState(format!(
+                "lease heartbeat failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            if let Err(error) = task.await {
+                *self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(format!("heartbeat task failed: {error}"));
+            }
+        }
+    }
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 
 impl AgentContext {
@@ -46,6 +136,7 @@ impl AgentContext {
         config: Value,
         lease_ttl: Duration,
     ) -> Result<Self> {
+        validate_lease_ttl(lease_ttl)?;
         let run = db::create_run(
             &pool,
             Uuid::new_v4(),
@@ -74,6 +165,7 @@ impl AgentContext {
         lease_ttl: Duration,
         recover: bool,
     ) -> Result<Self> {
+        validate_lease_ttl(lease_ttl)?;
         let owner_id = Uuid::new_v4();
         let lease = if recover {
             db::recover_run_lease(&pool, run_id, owner_id, lease_ttl).await?
@@ -86,11 +178,13 @@ impl AgentContext {
             let _ = db::release_run_lease(&pool, &lease).await;
             return Err(error);
         }
+        let heartbeat = LeaseHeartbeat::start(pool.clone(), lease, lease_ttl);
         Ok(Self {
             pool,
             run_id,
             lease,
             lease_ttl,
+            heartbeat,
         })
     }
 
@@ -124,7 +218,6 @@ impl AgentContext {
         tool_calls: &[ToolCall],
         stop_reason: &str,
     ) -> Result<()> {
-        self.renew_lease().await?;
         let llm_payload = serde_json::to_value(LlmCallPayload {
             content,
             tool_calls: tool_calls.to_vec(),
@@ -145,6 +238,7 @@ impl AgentContext {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let _guard = self.prepare_lease_operation().await?;
         db::append_llm_call_with_tool_intents_with_lease(
             &self.pool,
             &self.lease,
@@ -155,7 +249,7 @@ impl AgentContext {
     }
 
     pub async fn pending_tool_calls(&mut self) -> Result<Vec<PendingToolCall>> {
-        self.renew_lease().await?;
+        let _guard = self.prepare_lease_operation().await?;
         db::find_pending_tool_calls_with_lease(&self.pool, &self.lease)
             .await?
             .into_iter()
@@ -174,7 +268,7 @@ impl AgentContext {
     }
 
     pub async fn record_tool_result(&mut self, call_id: &str, content: Value) -> Result<()> {
-        self.renew_lease().await?;
+        let _guard = self.prepare_lease_operation().await?;
         db::record_tool_result_with_lease(&self.pool, &self.lease, call_id, &content).await?;
         Ok(())
     }
@@ -189,14 +283,15 @@ impl AgentContext {
         F: FnOnce(CheckpointState) -> Fut,
         Fut: Future<Output = Result<Verification>>,
     {
-        let candidate =
-            db::propose_checkpoint_with_lease(&self.pool, &self.lease, tool_call_id, &state)
-                .await?;
+        let candidate = {
+            let _guard = self.prepare_lease_operation().await?;
+            db::propose_checkpoint_with_lease(&self.pool, &self.lease, tool_call_id, &state).await?
+        };
         self.verify_checkpoint(candidate, verifier).await
     }
 
     pub async fn pending_checkpoint(&mut self) -> Result<Option<CheckpointRecord>> {
-        self.renew_lease().await?;
+        let _guard = self.prepare_lease_operation().await?;
         db::get_pending_checkpoint_with_lease(&self.pool, &self.lease).await
     }
 
@@ -209,11 +304,13 @@ impl AgentContext {
         F: FnOnce(CheckpointState) -> Fut,
         Fut: Future<Output = Result<Verification>>,
     {
-        self.renew_lease().await?;
-        let candidate =
-            db::get_checkpoint_candidate_with_lease(&self.pool, &self.lease, candidate.id).await?;
+        let candidate = {
+            let _guard = self.prepare_lease_operation().await?;
+            db::get_checkpoint_candidate_with_lease(&self.pool, &self.lease, candidate.id).await?
+        };
         let state = serde_json::from_value(candidate.state.clone())?;
         let verification = verifier(state).await?;
+        let _guard = self.prepare_lease_operation().await?;
         db::decide_checkpoint_with_lease(
             &self.pool,
             &self.lease,
@@ -224,18 +321,37 @@ impl AgentContext {
         .await
     }
 
-    pub async fn close(self) -> Result<()> {
-        db::release_run_lease(&self.pool, &self.lease).await
+    pub async fn close(mut self) -> Result<()> {
+        self.heartbeat.stop().await;
+        let heartbeat = self.heartbeat.ensure_healthy();
+        let release = db::release_run_lease(&self.pool, &self.lease).await;
+        heartbeat.and(release)
     }
 
     pub async fn complete(mut self) -> Result<()> {
-        self.renew_lease().await?;
-        db::complete_run_with_lease(&self.pool, &self.lease).await
+        self.heartbeat.stop().await;
+        let result = async {
+            self.heartbeat.ensure_healthy()?;
+            self.lease = db::renew_run_lease(&self.pool, &self.lease, self.lease_ttl).await?;
+            db::complete_run_with_lease(&self.pool, &self.lease).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = db::release_run_lease(&self.pool, &self.lease).await;
+        }
+        result
     }
 
     pub async fn renew_lease(&mut self) -> Result<()> {
-        self.lease = db::renew_run_lease(&self.pool, &self.lease, self.lease_ttl).await?;
+        let _guard = self.prepare_lease_operation().await?;
         Ok(())
+    }
+
+    async fn prepare_lease_operation(&mut self) -> Result<OwnedMutexGuard<()>> {
+        let guard = Arc::clone(&self.heartbeat.gate).lock_owned().await;
+        self.heartbeat.ensure_healthy()?;
+        self.lease = db::renew_run_lease(&self.pool, &self.lease, self.lease_ttl).await?;
+        Ok(guard)
     }
 }
 
@@ -257,4 +373,14 @@ struct ToolCallPayload {
 
 fn one_tool_call() -> usize {
     1
+}
+
+fn validate_lease_ttl(ttl: Duration) -> Result<()> {
+    if ttl < MIN_LEASE_TTL {
+        return Err(Error::InvalidState(format!(
+            "run lease TTL must be at least {} ms",
+            MIN_LEASE_TTL.as_millis()
+        )));
+    }
+    Ok(())
 }

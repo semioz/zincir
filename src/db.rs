@@ -97,10 +97,7 @@ async fn claim_run_lease(
     ttl: Duration,
     recover: bool,
 ) -> Result<RunLease> {
-    let now_ms = Utc::now().timestamp_millis();
-    let expires_at_ms = now_ms
-        .checked_add(duration_to_millis(ttl)?)
-        .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
+    let ttl_ms = duration_to_millis(ttl)?;
     let mut connection = pool.acquire().await?;
     begin_immediate(&mut connection).await?;
 
@@ -112,6 +109,10 @@ async fn claim_run_lease(
             )));
         }
 
+        let expires_at_ms = Utc::now()
+            .timestamp_millis()
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
         let epoch: Option<i64> = sqlx::query_scalar(
             "UPDATE agent_runs
              SET lease_owner = ?, lease_epoch = lease_epoch + 1,
@@ -148,33 +149,42 @@ pub async fn renew_run_lease(
     lease: &RunLease,
     ttl: Duration,
 ) -> Result<RunLease> {
-    let now_ms = Utc::now().timestamp_millis();
-    let expires_at_ms = now_ms
-        .checked_add(duration_to_millis(ttl)?)
-        .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
-    let rows = sqlx::query(
-        "UPDATE agent_runs SET lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
-           AND status IN ('pending', 'running') AND lease_expires_at_ms > ?",
-    )
-    .bind(expires_at_ms)
-    .bind(lease.run_id)
-    .bind(lease.owner_id)
-    .bind(lease.epoch)
-    .bind(now_ms)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if rows != 1 {
-        return Err(Error::InvalidState(format!(
-            "run lease {}:{} is no longer active",
-            lease.run_id, lease.epoch
-        )));
+    let ttl_ms = duration_to_millis(ttl)?;
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        let now_ms = Utc::now().timestamp_millis();
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
+        let rows = sqlx::query(
+            "UPDATE agent_runs SET lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND lease_owner = ? AND lease_epoch = ?
+               AND status IN ('pending', 'running') AND lease_expires_at_ms > ?",
+        )
+        .bind(expires_at_ms)
+        .bind(lease.run_id)
+        .bind(lease.owner_id)
+        .bind(lease.epoch)
+        .bind(now_ms)
+        .execute(&mut *connection)
+        .await?
+        .rows_affected();
+        if rows != 1 {
+            return Err(Error::InvalidState(format!(
+                "run lease {}:{} is no longer active",
+                lease.run_id, lease.epoch
+            )));
+        }
+        Ok(RunLease {
+            expires_at_ms,
+            ..*lease
+        })
     }
-    Ok(RunLease {
-        expires_at_ms,
-        ..*lease
-    })
+    .await;
+
+    finish_transaction(&mut connection, result).await
 }
 
 pub async fn release_run_lease(pool: &SqlitePool, lease: &RunLease) -> Result<()> {
@@ -1367,6 +1377,31 @@ mod tests {
 
         assert_eq!(renewed.epoch, lease.epoch);
         assert!(renewed.expires_at_ms > lease.expires_at_ms);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_cannot_resurrect_a_lease_that_expires_behind_a_writer() {
+        let (pool, directory) = test_pool().await;
+        let run = test_run(&pool).await;
+        let lease = acquire_run_lease(&pool, run.id, Uuid::new_v4(), Duration::from_millis(80))
+            .await
+            .unwrap();
+        let mut blocker = pool.acquire().await.unwrap();
+        begin_immediate(&mut blocker).await.unwrap();
+        let renewal_pool = pool.clone();
+        let renewal = tokio::spawn(async move {
+            renew_run_lease(&renewal_pool, &lease, Duration::from_secs(1)).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+
+        let result = renewal.await.unwrap();
+
+        assert!(matches!(result, Err(Error::InvalidState(_))));
+        drop(blocker);
         pool.close().await;
         std::fs::remove_dir_all(directory).unwrap();
     }

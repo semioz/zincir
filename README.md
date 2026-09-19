@@ -48,7 +48,7 @@ Current foundation:
 - The crate also includes `examples/durable_agent.rs`, a small custom loop with an idempotent demo tool.
 - Model responses and tool intent/results are recorded in a per-run event log.
 - Inflight runs expose their durable state for application-controlled recovery.
-- Expiring run leases and fencing tokens prevent concurrent contexts from persisting work for the same run.
+- Expiring run leases, automatic heartbeats, and fencing tokens prevent concurrent contexts from persisting work for the same run.
 - Applications submit semantic checkpoint candidates and verify them with async Rust closures.
 - Accepted checkpoints let applications construct fresh contexts from verified progress.
 - Deterministic tests verify process-kill recovery before and after the demo tool's atomic side effect and after checkpoint acceptance.
@@ -84,7 +84,7 @@ Effect-once behavior requires cooperation from the tool: it must be idempotent, 
 
 ### Embedded agent SDK
 
-`AgentContext` owns the durable run lease while your application owns the loop. It can create or recover a run, atomically record a model response with all tool intents, list pending tools, persist tool results, submit or resume checkpoint verification, expose state after the latest accepted checkpoint, and complete or release the run.
+`AgentContext` owns the durable run lease while your application owns the loop. It renews that lease automatically in the background and surfaces heartbeat failure before accepting more writes. Lease TTLs below 30 ms are rejected; production values should leave ample room for scheduler and database contention. It can create or recover a run, atomically record a model response with all tool intents, list pending tools, persist tool results, submit or resume checkpoint verification, expose state after the latest accepted checkpoint, and complete or release the run.
 
 ```rust
 let mut ctx = AgentContext::create(
@@ -244,13 +244,12 @@ It does not currently guarantee:
 - That an in-progress provider call will not be repeated after a crash.
 - Deterministic re-generation by an LLM.
 - Distributed ownership of the same run across machines.
-- Continuous lease heartbeats during provider or tool calls longer than the configured lease TTL (five minutes in the reference example).
 
 ## Roadmap
 
 1. Stabilize `AgentContext` and add provider-agnostic custom-agent examples.
 2. Bind coding checkpoints to a generated workspace revision instead of agent-supplied artifact labels.
-3. Add an automatic resume worker and continuous lease heartbeats.
+3. Add an automatic resume worker.
 4. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
 5. Add durable signals and human approval waits.
 6. Add child runs and durable spawn/join after the single-agent path is proven.
