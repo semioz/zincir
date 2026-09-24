@@ -155,8 +155,25 @@ impl AgentContext {
 
     /// Explicit recovery fences the previous owner. Call only after confirming
     /// that its process is dead.
-    pub async fn recover(pool: SqlitePool, run_id: Uuid, lease_ttl: Duration) -> Result<Self> {
+    pub async fn force_recover(
+        pool: SqlitePool,
+        run_id: Uuid,
+        lease_ttl: Duration,
+    ) -> Result<Self> {
         Self::claim(pool, run_id, lease_ttl, true).await
+    }
+
+    /// Atomically claims the next ownerless or expired non-terminal run.
+    pub async fn claim_next_recoverable(
+        pool: SqlitePool,
+        lease_ttl: Duration,
+    ) -> Result<Option<Self>> {
+        validate_lease_ttl(lease_ttl)?;
+        let Some(lease) = db::claim_next_recoverable_run(&pool, Uuid::new_v4(), lease_ttl).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::from_lease(pool, lease, lease_ttl)))
     }
 
     async fn claim(
@@ -178,14 +195,18 @@ impl AgentContext {
             let _ = db::release_run_lease(&pool, &lease).await;
             return Err(error);
         }
+        Ok(Self::from_lease(pool, lease, lease_ttl))
+    }
+
+    fn from_lease(pool: SqlitePool, lease: RunLease, lease_ttl: Duration) -> Self {
         let heartbeat = LeaseHeartbeat::start(pool.clone(), lease, lease_ttl);
-        Ok(Self {
+        Self {
             pool,
-            run_id,
+            run_id: lease.run_id,
             lease,
             lease_ttl,
             heartbeat,
-        })
+        }
     }
 
     pub fn run_id(&self) -> Uuid {
@@ -375,7 +396,7 @@ fn one_tool_call() -> usize {
     1
 }
 
-fn validate_lease_ttl(ttl: Duration) -> Result<()> {
+pub(crate) fn validate_lease_ttl(ttl: Duration) -> Result<()> {
     if ttl < MIN_LEASE_TTL {
         return Err(Error::InvalidState(format!(
             "run lease TTL must be at least {} ms",

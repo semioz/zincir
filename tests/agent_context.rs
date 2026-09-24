@@ -270,7 +270,7 @@ async fn fenced_context_cannot_obtain_pending_work() {
         )
         .await
         .unwrap();
-    let mut recovered = AgentContext::recover(pool.clone(), run_id, Duration::from_secs(30))
+    let mut recovered = AgentContext::force_recover(pool.clone(), run_id, Duration::from_secs(30))
         .await
         .unwrap();
 
@@ -344,9 +344,10 @@ async fn heartbeat_failure_is_reported_before_more_writes() {
     )
     .await
     .unwrap();
-    let recovered = AgentContext::recover(pool.clone(), first.run_id(), Duration::from_secs(30))
-        .await
-        .unwrap();
+    let recovered =
+        AgentContext::force_recover(pool.clone(), first.run_id(), Duration::from_secs(30))
+            .await
+            .unwrap();
     wait_for_heartbeat_failure(&mut first).await;
 
     let error = first
@@ -614,7 +615,7 @@ async fn custom_agent_recovers_an_unfinished_checkpoint() {
     });
     first.close().await.unwrap();
 
-    let mut recovered = AgentContext::recover(pool.clone(), run.id, Duration::from_secs(30))
+    let mut recovered = AgentContext::force_recover(pool.clone(), run.id, Duration::from_secs(30))
         .await
         .unwrap();
     let accepted = recovered

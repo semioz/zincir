@@ -144,6 +144,69 @@ async fn claim_run_lease(
     finish_transaction(&mut connection, result).await
 }
 
+pub async fn claim_next_recoverable_run(
+    pool: &SqlitePool,
+    owner_id: Uuid,
+    ttl: Duration,
+) -> Result<Option<RunLease>> {
+    let ttl_ms = duration_to_millis(ttl)?;
+    let mut connection = pool.acquire().await?;
+    begin_immediate(&mut connection).await?;
+
+    let result = async {
+        let now_ms = Utc::now().timestamp_millis();
+        let candidate: Option<(Uuid, RunStatus)> = sqlx::query_as(
+            "SELECT id, status FROM agent_runs
+             WHERE status IN ('pending', 'running')
+               AND (lease_owner IS NULL OR lease_expires_at_ms <= ?)
+             ORDER BY created_at, id
+             LIMIT 1",
+        )
+        .bind(now_ms)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let Some((run_id, status)) = candidate else {
+            return Ok(None);
+        };
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::InvalidState("run lease duration is too large".into()))?;
+        let epoch: i64 = sqlx::query_scalar(
+            "UPDATE agent_runs
+             SET status = 'running', lease_owner = ?, lease_epoch = lease_epoch + 1,
+                 lease_expires_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+             RETURNING lease_epoch",
+        )
+        .bind(owner_id)
+        .bind(expires_at_ms)
+        .bind(run_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        if status == RunStatus::Pending {
+            let seq = next_event_seq(&mut connection, run_id).await?;
+            insert_event(
+                &mut connection,
+                run_id,
+                seq,
+                EventType::StateTransition,
+                &json!({ "from": RunStatus::Pending, "to": RunStatus::Running }),
+                None,
+            )
+            .await?;
+        }
+        Ok(Some(RunLease {
+            run_id,
+            owner_id,
+            epoch,
+            expires_at_ms,
+        }))
+    }
+    .await;
+
+    finish_transaction(&mut connection, result).await
+}
+
 pub async fn renew_run_lease(
     pool: &SqlitePool,
     lease: &RunLease,

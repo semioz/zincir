@@ -45,7 +45,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let ids = runs.iter().map(|run| run.id).collect::<Vec<_>>();
         for run in runs {
             run_agent(
-                AgentContext::recover(pool.clone(), run.id, LEASE_TTL).await?,
+                AgentContext::force_recover(pool.clone(), run.id, LEASE_TTL).await?,
                 &output_directory,
             )
             .await?;

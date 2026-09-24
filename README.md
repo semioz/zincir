@@ -52,7 +52,7 @@ Current foundation:
 - Applications submit semantic checkpoint candidates and verify them with async Rust closures.
 - Accepted checkpoints let applications construct fresh contexts from verified progress.
 - Deterministic tests verify process-kill recovery before and after the demo tool's atomic side effect and after checkpoint acceptance.
-- Multi-agent coordination, an automatic resume worker, and sandboxing are not implemented; model and tool integrations belong to the application.
+- Multi-agent coordination and sandboxing are not implemented; model and tool integrations belong to the application.
 
 ## Current capabilities
 
@@ -101,7 +101,32 @@ let response = my_agent.run(durable).await?;
 ctx.record_response(response.content, &response.tool_calls, "tool_use").await?;
 ```
 
-Checkpoint verification is supplied by application code as an async closure. If it is interrupted after the candidate is persisted, `AgentContext::recover()` and `pending_checkpoint()` expose it for another verification attempt.
+Checkpoint verification is supplied by application code as an async closure. If it is interrupted after the candidate is persisted, the resume worker or an operator-controlled `AgentContext::force_recover()` exposes it through `pending_checkpoint()` for another verification attempt.
+
+### Automatic resume worker
+
+`ResumeWorker` polls SQLite for ownerless or expired non-terminal runs, claims each run atomically, and passes an owned `AgentContext` to application code. Active leases and terminal runs are never dispatched.
+
+Run the self-contained example, which abandons a run and automatically resumes it after lease expiry:
+
+```bash
+RUST_LOG=info cargo run --example automatic_resume
+```
+
+The SDK usage is:
+
+```rust
+ResumeWorker::new(pool, Duration::from_secs(30))
+    .poll_interval(Duration::from_secs(1))
+    .max_concurrency(4)
+    .run(
+        |ctx| async move { resume_my_agent(ctx).await },
+        async { let _ = tokio::signal::ctrl_c().await; },
+    )
+    .await?;
+```
+
+The handler owns the context and must call `complete()` or `close()`. If it fails or is interrupted, dropping the context stops its heartbeat; the run becomes recoverable after its lease expires and is delivered again. This is at-least-once retry without persisted backoff or attempt limits. `force_recover()` remains an explicit escape hatch that can fence an active owner and must only be used after confirming that process is dead.
 
 ### Reference example
 
@@ -147,7 +172,7 @@ The schema includes parent/child run relationships and a durable `messages` tabl
 Your model + tools + agent loop
               │
               ▼
-         AgentContext
+         AgentContext ◄── optional ResumeWorker
               │
               └── SQLite runs + events + checkpoints
 ```
@@ -249,11 +274,10 @@ It does not currently guarantee:
 
 1. Stabilize `AgentContext` and add provider-agnostic custom-agent examples.
 2. Bind coding checkpoints to a generated workspace revision instead of agent-supplied artifact labels.
-3. Add an automatic resume worker.
-4. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
-5. Add durable signals and human approval waits.
-6. Add child runs and durable spawn/join after the single-agent path is proven.
-7. Add Postgres only when multi-machine execution is required.
+3. Add budgets for tokens, tool calls, and wall time, plus stuck/spin detection.
+4. Add durable signals and human approval waits.
+5. Add child runs and durable spawn/join after the single-agent path is proven.
+6. Add Postgres only when multi-machine execution is required.
 
 The target demonstration is a small custom agent that survives an injected process kill, restores verified progress, continues in a fresh context, and completes without duplicating external effects. The accompanying benchmark will vary three dimensions independently: crash durability, context strategy, and verification policy.
 
