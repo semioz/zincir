@@ -4,7 +4,7 @@ Durable, resumable execution for long-horizon AI agents.
 
 Zincir is an embedded Rust SDK for developers building their own long-horizon agents. Bring your own model client, tools, prompts, and agent loop; Zincir persists execution in local SQLite so interrupted runs can recover without blindly repeating completed work. It keeps the event log as ground truth while exposing verified progress for fresh contexts. It is a single-machine durability layer, not an agent framework or distributed workflow engine.
 
-## Who it is for
+## Use Case
 
 Use Zincir when you are implementing an agent that can call tools, make costly model requests, or run long enough that a process restart is a normal failure mode:
 
